@@ -1,0 +1,2668 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-HK">
+<head>
+<script>// 模擬 Google Apps Script 伺服器環境，讓真正的 Code.gs 在瀏覽器內執行
+(function(){
+  const sheets = {};
+  function mkRange(sh, r, c, nr, nc){
+    const R = {
+      getValues(){ const out=[]; for(let i=0;i<nr;i++){ const row=[]; for(let j=0;j<nc;j++){ const v=(sh.data[r-1+i]||[])[c-1+j]; row.push(v===undefined?'':v);} out.push(row);} return out; },
+      getDisplayValues(){ return R.getValues().map(row=>row.map(v=>{ let s=String(v); if(/^'[=+\-@]/.test(s)) s=s.slice(1); return s; })); },
+      setValues(vals){ vals.forEach((row,i)=>{ while(sh.data.length<r+i) sh.data.push([]); row.forEach((v,j)=>{ sh.data[r-1+i][c-1+j]=v; }); }); return R; },
+      setFontWeight(){return R;}, setBackground(){return R;}, setFontColor(){return R;}, setNumberFormat(){return R;}
+    };
+    return R;
+  }
+  function mkSheet(name){
+    const sh = { name, data: [],
+      getName(){return name;},
+      getLastRow(){ let n=sh.data.length; while(n>0 && !(sh.data[n-1]||[]).some(v=>v!==''&&v!==undefined)) n--; return n; },
+      getLastColumn(){ return sh.data.reduce((m,r)=>Math.max(m,r.length),0); },
+      getMaxRows(){ return 1000; },
+      getRange(r,c,nr,nc){ return mkRange(sh,r,c,nr||1,nc||1); },
+      getDataRange(){ return mkRange(sh,1,1,Math.max(sh.getLastRow(),1),Math.max(sh.getLastColumn(),1)); },
+      setFrozenRows(){}, appendRow(row){ sh.data.length=sh.getLastRow(); sh.data.push(row.slice()); },
+      deleteRows(start,n){ sh.data.splice(start-1,n); }
+    };
+    return sh;
+  }
+  const ss = {
+    getSheetByName(n){ return sheets[n]||null; },
+    insertSheet(n){ sheets[n]=mkSheet(n); return sheets[n]; },
+    getSheets(){ return Object.values(sheets); },
+    deleteSheet(sh){ delete sheets[sh.name]; },
+    setSpreadsheetTimeZone(){}
+  };
+  window.__sheets = sheets;
+  window.__user = 'kptsui@g.honwah.edu.hk';
+  window.SpreadsheetApp = { getActiveSpreadsheet(){ return ss; } };
+  window.Session = { getActiveUser(){ return { getEmail(){ return window.__user; } }; } };
+  window.LockService = { getScriptLock(){ return { tryLock(){return true;}, waitLock(){}, releaseLock(){} }; } };
+  window.Utilities = {
+    getUuid(){ return crypto.randomUUID(); },
+    formatDate(d, tz, fmt){
+      const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(d).map(x=>[x.type,x.value]));
+      return fmt.replace('yyyy',p.year).replace('MM',p.month).replace('dd',p.day).replace('HH',p.hour).replace('mm',p.minute).replace('ss',p.second).replace(/^M$/, String(+p.month));
+    }
+  };
+  window.HtmlService = {};
+  // google.script.run 模擬（非同步、JSON 往返，與真實環境一樣只傳可序列化資料）
+  window.__calls = [];
+  function runner(succ, fail){
+    return new Proxy({}, { get(_, prop){
+      if (prop==='withSuccessHandler') return f => runner(f, fail);
+      if (prop==='withFailureHandler') return f => runner(succ, f);
+      return (...args) => setTimeout(() => {
+        window.__calls.push(prop);
+        try { const fn = window.__srv[prop]; if (typeof fn !== 'function' || /_$/.test(prop)) throw new Error('Script function not found: ' + prop);
+          const res = fn(...JSON.parse(JSON.stringify(args))); succ && succ(res === undefined ? undefined : JSON.parse(JSON.stringify(res))); }
+        catch(e){ console.warn('server error', prop, e.message); fail && fail(e); }
+      }, 15);
+    }});
+  }
+  window.google = { script: { run: runner(null, null) } };
+})();
+</script>
+<script>window.__srv=(function(){/**
+ * 漢華升就輔中六個人輔導系統 V6 — 後端 (Google Apps Script)
+ * 漢華中學 升學及就業輔導組
+ *
+ * 部署設定：執行身分「我」(Execute as: Me)；存取權「漢華中學網域內的任何人」。
+ * 每個伺服器函式都會以 Session.getActiveUser().getEmail() 核對「授權老師」分頁。
+ */
+
+var TZ = 'Asia/Hong_Kong';
+var APP_TITLE = '漢華升就輔中六個人輔導系統 V6';
+var SEED_TEACHER = 'kptsui@g.honwah.edu.hk';
+
+var SHEET = {
+  STUDENTS: '學生名單',
+  RECORDS: '面談紀錄',
+  TEACHERS: '授權老師',
+  LOG: '操作記錄',
+  YEARS: '學年',
+  CLASS_CFG: '班別設定'
+};
+
+// 科目：key 與工作表欄名（順序即為欄位順序）
+var SUBJECTS = [
+  ['chi', '中文'], ['eng', '英文'], ['math', '數學'], ['csd', '公民'],
+  ['m2', 'M2'], ['phy', '物理'], ['chem', '化學'], ['bio', '生物'],
+  ['geo', '地理'], ['hist', '歷史'], ['chi_hist', '中史'], ['econ', '經濟'],
+  ['bafs', '企財'], ['th', '旅款'], ['va', '視藝'], ['music', '音樂'], ['pe', '體育']
+];
+
+var STUDENT_BASE = ['學年', '班別', '學號', '中文姓名', '英文姓名', '註冊編號', 'STRN', '備註'];
+var STUDENT_TAIL = ['成績表原始資料(JSON)', '修改者', '修改時間'];
+
+// [key, 欄名]
+var RECORD_COLS = [
+  ['id', '紀錄ID'], ['year', '學年'], ['cls', '班別'], ['no', '學號'], ['chi', '中文姓名'],
+  ['date', '會面日期'], ['teacher', '負責老師'], ['duration', '會面時間(約歷時/分鐘)'],
+  ['s6meet', '中六面見'], ['note', '備註'],
+  ['probe', 'Probe'], ['holland', 'HOLLAND CODE (首三項，如有)'], ['career', '夢想的職業'],
+  ['course', '夢想升讀的課程'], ['jupas', 'Jupas首三'],
+  ['opSubject', '關於學科選擇'], ['opCareer', '關於職業選擇'], ['opAction', '關於未來可以考慮的行動'],
+  ['opOther', '其他'], ['otherSubjects', '其他科目成績'], ['grades', '成績快照(JSON)'],
+  ['createdBy', '建立者'], ['createdAt', '建立時間'], ['updatedBy', '最後修改者'], ['updatedAt', '修改時間']
+];
+
+/* ───────────────────────── 網頁入口 ───────────────────────── */
+
+function doGet(e) {
+  var email = activeEmail_();
+  if (!isAuthorized_(email)) {
+    var t = HtmlService.createTemplateFromFile('Unauthorized');
+    t.email = email || '（無法取得電郵，請以學校帳戶登入）';
+    return t.evaluate().setTitle('未獲授權 — ' + APP_TITLE)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+  return HtmlService.createTemplateFromFile('Index').evaluate()
+    .setTitle(APP_TITLE)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.DEFAULT);
+}
+
+function include(name) {
+  return HtmlService.createHtmlOutputFromFile(name).getContent();
+}
+
+/* ───────────────────────── 安裝 setup() ───────────────────────── */
+
+/** 首次使用：在 Apps Script 編輯器選擇 setup 並按「執行」。可重複執行，不會刪除資料。 */
+function setup() {
+  var ss = ss_();
+  ensureSheet_(ss, SHEET.STUDENTS, studentHeaders_(), true);
+  ensureSheet_(ss, SHEET.RECORDS, RECORD_COLS.map(function (c) { return c[1]; }), true);
+  var tSheet = ensureSheet_(ss, SHEET.TEACHERS, ['電郵', '姓名（可選）', '備註'], false);
+  ensureSheet_(ss, SHEET.LOG, ['時間', '使用者', '動作', '詳情'], false);
+  ensureSheet_(ss, SHEET.YEARS, ['學年'], true);
+  ensureSheet_(ss, SHEET.CLASS_CFG, ['學年', '班別', '預設負責老師'], true);
+
+  // 種子：授權老師
+  var emails = tSheet.getRange(2, 1, Math.max(tSheet.getLastRow() - 1, 1), 1).getValues()
+    .map(function (r) { return String(r[0]).trim().toLowerCase(); });
+  if (emails.indexOf(SEED_TEACHER) < 0) tSheet.appendRow([SEED_TEACHER, '系統管理員', '由 setup() 加入']);
+
+  // 種子：學年
+  var ySheet = ss.getSheetByName(SHEET.YEARS);
+  if (ySheet.getLastRow() < 2) ySheet.appendRow([defaultYear_()]);
+
+  // 移除新試算表預設的空白「工作表1 / Sheet1」
+  ['工作表1', 'Sheet1', '工作表 1'].forEach(function (n) {
+    var sh = ss.getSheetByName(n);
+    if (sh && ss.getSheets().length > 1 && sh.getLastRow() === 0) ss.deleteSheet(sh);
+  });
+  ss.setSpreadsheetTimeZone(TZ);
+  log_('setup', '建立 / 檢查工作表');
+  return '完成：已建立或檢查所有分頁。';
+}
+
+function studentHeaders_() {
+  return STUDENT_BASE.concat(SUBJECTS.map(function (s) { return s[1]; })).concat(STUDENT_TAIL);
+}
+
+function ensureSheet_(ss, name, headers, allText) {
+  var sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  var lastCol = sh.getLastColumn();
+  var current = lastCol ? sh.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+  // 補上缺少的欄（保留現有資料）
+  headers.forEach(function (h) {
+    if (current.indexOf(h) < 0) { current.push(h); }
+  });
+  sh.getRange(1, 1, 1, current.length).setValues([current])
+    .setFontWeight('bold').setBackground('#1f3a5f').setFontColor('#ffffff');
+  sh.setFrozenRows(1);
+  if (allText) {
+    // 以純文字儲存，避免「5*」「01」等被轉換
+    sh.getRange(1, 1, sh.getMaxRows(), current.length).setNumberFormat('@');
+  }
+  return sh;
+}
+
+/* ───────────────────────── 授權 ───────────────────────── */
+
+function activeEmail_() {
+  try { return String(Session.getActiveUser().getEmail() || '').trim().toLowerCase(); }
+  catch (e) { return ''; }
+}
+
+function isAuthorized_(email) {
+  if (!email) return false;
+  var sh = ss_().getSheetByName(SHEET.TEACHERS);
+  if (!sh) return email === SEED_TEACHER; // 尚未執行 setup()
+  var n = sh.getLastRow() - 1;
+  if (n < 1) return false;
+  var list = sh.getRange(2, 1, n, 1).getValues();
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i][0]).trim().toLowerCase() === email) return true;
+  }
+  return false;
+}
+
+/** 所有 api* 函式第一行都要呼叫。未獲授權即拋出錯誤。 */
+function auth_() {
+  var email = activeEmail_();
+  if (!isAuthorized_(email)) throw new Error('未獲授權：' + (email || '未知使用者') + ' 不在「授權老師」名單內。');
+  return email;
+}
+
+/* ───────────────────────── 工具 ───────────────────────── */
+
+function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+function now_() { return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss'); }
+
+function defaultYear_() {
+  var y = Number(Utilities.formatDate(new Date(), TZ, 'yyyy'));
+  var m = Number(Utilities.formatDate(new Date(), TZ, 'M'));
+  var start = m >= 8 ? y : y - 1; // 8 月起為新學年
+  return start + '-' + String(start + 1).slice(-2);
+}
+
+/** 防止試算表公式注入：以 = + - @ 開頭的文字前加 ' */
+function safe_(v) {
+  if (v === null || v === undefined) return '';
+  var s = String(v);
+  if (s.length > 45000) s = s.slice(0, 45000);
+  return /^[=+\-@]/.test(s) ? "'" + s : s;
+}
+function unsafe_(v) {
+  var s = (v === null || v === undefined) ? '' : String(v);
+  return /^'[=+\-@]/.test(s) ? s.slice(1) : s; // 還原 safe_() 加上的 '
+}
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw new Error('系統繁忙（其他老師正在儲存），請稍後再試。');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function log_(action, detail) {
+  try {
+    var sh = ss_().getSheetByName(SHEET.LOG);
+    if (sh) sh.appendRow([now_(), activeEmail_(), action, safe_(String(detail || '').slice(0, 500))]);
+  } catch (e) { /* 記錄失敗不影響主要操作 */ }
+}
+
+function readTable_(name) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('找不到分頁「' + name + '」，請先執行 setup()。');
+  var values = sh.getDataRange().getDisplayValues();
+  var headers = values.shift() || [];
+  return { sheet: sh, headers: headers, rows: values };
+}
+
+function col_(headers, name) {
+  var i = headers.indexOf(name);
+  if (i < 0) throw new Error('分頁缺少欄位「' + name + '」，請重新執行 setup()。');
+  return i;
+}
+
+function normYear_(y) {
+  y = String(y || '').trim().replace('/', '-');
+  if (!/^\d{4}-\d{2}$/.test(y)) throw new Error('學年格式不正確：' + y);
+  return y;
+}
+function sKey_(y, c, n) { return [String(y).trim(), String(c).trim().toUpperCase(), String(n).trim().replace(/^0+(?=\d)/, '')].join('|'); }
+
+/* ───────────────────────── 讀取 ───────────────────────── */
+
+function rowToStudent_(h, r) {
+  var g = {};
+  SUBJECTS.forEach(function (s) {
+    var i = h.indexOf(s[1]);
+    if (i >= 0 && r[i] !== '') g[s[0]] = String(r[i]);
+  });
+  var pdf = {};
+  try { var j = r[h.indexOf('成績表原始資料(JSON)')]; if (j) pdf = JSON.parse(j); } catch (e) { pdf = {}; }
+  return {
+    year: r[col_(h, '學年')], cls: r[col_(h, '班別')], no: r[col_(h, '學號')],
+    chi: unsafe_(r[col_(h, '中文姓名')]), eng: unsafe_(r[col_(h, '英文姓名')]), reg: unsafe_(r[col_(h, '註冊編號')]), strn: unsafe_(r[col_(h, 'STRN')]), remarks: unsafe_(r[col_(h, '備註')]),
+    grades: g, pdfGrades: pdf
+  };
+}
+
+function rowToRecord_(h, r) {
+  var o = {};
+  RECORD_COLS.forEach(function (c) {
+    var i = h.indexOf(c[1]);
+    o[c[0]] = i >= 0 ? unsafe_(r[i]) : '';
+  });
+  try { o.grades = o.grades ? JSON.parse(o.grades) : {}; } catch (e) { o.grades = {}; }
+  return o;
+}
+
+/** 啟動時一次過載入全部資料 */
+function apiBootstrap() {
+  var email = auth_();
+  var st = readTable_(SHEET.STUDENTS);
+  var rc = readTable_(SHEET.RECORDS);
+  var students = st.rows.filter(function (r) { return r.join('') !== ''; })
+    .map(function (r) { return rowToStudent_(st.headers, r); });
+  var records = rc.rows.filter(function (r) { return r[0] !== ''; })
+    .map(function (r) { return rowToRecord_(rc.headers, r); });
+  return { email: email, years: listYears_(students), students: students, records: records, classDefaults: listClassDefaults_(), serverTime: now_() };
+}
+
+function listClassDefaults_() {
+  var sh = ss_().getSheetByName(SHEET.CLASS_CFG);
+  if (!sh || sh.getLastRow() < 2) return [];
+  var t = readTable_(SHEET.CLASS_CFG), h = t.headers;
+  return t.rows.filter(function (r) { return r.join('') !== ''; }).map(function (r) {
+    return { year: r[col_(h, '學年')], cls: String(r[col_(h, '班別')] || '').toUpperCase(), teacher: unsafe_(r[col_(h, '預設負責老師')]) };
+  }).filter(function (o) { return o.year && o.cls; });
+}
+
+/** 設定某學年某班的預設負責老師（空字串＝清除） */
+function apiSaveClassDefault(year, cls, teacher) {
+  var email = auth_();
+  year = normYear_(year);
+  cls = String(cls || '').trim().toUpperCase();
+  teacher = String(teacher || '').trim();
+  if (!cls) throw new Error('請指定班別');
+  return withLock_(function () {
+    var t = readTable_(SHEET.CLASS_CFG), h = t.headers, sh = t.sheet;
+    var idx = -1;
+    t.rows.forEach(function (r, i) {
+      if (r[col_(h, '學年')] === year && String(r[col_(h, '班別')]).toUpperCase() === cls) idx = i;
+    });
+    if (!teacher) {
+      if (idx >= 0) { sh.deleteRows(idx + 2, 1); log_('清除班別預設老師', year + ' ' + cls); }
+      return listClassDefaults_();
+    }
+    var row = h.map(function () { return ''; });
+    row[col_(h, '學年')] = year; row[col_(h, '班別')] = cls; row[col_(h, '預設負責老師')] = safe_(teacher);
+    if (idx >= 0) sh.getRange(idx + 2, 1, 1, row.length).setValues([row]);
+    else sh.appendRow(row);
+    log_('設定班別預設老師', year + ' ' + cls + ' → ' + teacher);
+    return listClassDefaults_();
+  });
+}
+
+/** 把本班預設負責老師套用到該班所有「負責老師」空白的面談紀錄 */
+function apiApplyClassTeacher(year, cls) {
+  var email = auth_();
+  year = normYear_(year);
+  cls = String(cls || '').trim().toUpperCase();
+  var defs = listClassDefaults_().filter(function (d) { return d.year === year && d.cls === cls; });
+  if (!defs.length || !defs[0].teacher) throw new Error(cls + ' 尚未設定預設負責老師');
+  var teacher = defs[0].teacher;
+  return withLock_(function () {
+    var t = readTable_(SHEET.RECORDS), h = t.headers, sh = t.sheet;
+    var n = 0;
+    t.rows.forEach(function (r, i) {
+      if (r[col_(h, '學年')] !== year || String(r[col_(h, '班別')]).toUpperCase() !== cls) return;
+      if (String(r[col_(h, '負責老師')] || '').trim()) return;
+      r[col_(h, '負責老師')] = safe_(teacher);
+      r[col_(h, '最後修改者')] = email; r[col_(h, '修改時間')] = now_();
+      sh.getRange(i + 2, 1, 1, r.length).setValues([r]);
+      n++;
+    });
+    log_('套用班別預設老師', year + ' ' + cls + ' → ' + teacher + '（' + n + ' 份）');
+    return { updated: n, teacher: teacher };
+  });
+}
+
+
+function listYears_(students) {
+  var set = {};
+  var ys = ss_().getSheetByName(SHEET.YEARS);
+  if (ys && ys.getLastRow() > 1) {
+    ys.getRange(2, 1, ys.getLastRow() - 1, 1).getDisplayValues().forEach(function (r) { if (r[0]) set[r[0]] = 1; });
+  }
+  (students || []).forEach(function (s) { if (s.year) set[s.year] = 1; });
+  var arr = Object.keys(set).sort();
+  if (!arr.length) arr = [defaultYear_()];
+  return arr;
+}
+
+/* ───────────────────────── 學年 ───────────────────────── */
+
+function apiAddYear(year) {
+  auth_();
+  year = normYear_(year);
+  return withLock_(function () {
+    var sh = ss_().getSheetByName(SHEET.YEARS);
+    var have = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getDisplayValues().map(function (r) { return r[0]; }) : [];
+    if (have.indexOf(year) < 0) sh.appendRow([year]);
+    log_('新增學年', year);
+    return listYears_([]);
+  });
+}
+
+function apiDeleteYear(year) {
+  auth_();
+  year = normYear_(year);
+  return withLock_(function () {
+    var a = deleteRowsWhere_(SHEET.STUDENTS, function (h, r) { return r[col_(h, '學年')] === year; });
+    var b = deleteRowsWhere_(SHEET.RECORDS, function (h, r) { return r[col_(h, '學年')] === year; });
+    deleteRowsWhere_(SHEET.YEARS, function (h, r) { return r[0] === year; });
+    deleteRowsWhere_(SHEET.CLASS_CFG, function (h, r) { return r[col_(h, '學年')] === year; });
+    log_('刪除學年', year + '：學生 ' + a + '、紀錄 ' + b);
+    return { students: a, records: b };
+  });
+}
+
+/* ───────────────────────── 學生 ───────────────────────── */
+
+/** 新增 / 更新學生（以 學年+班別+學號 為鍵）。list: [{year,cls,no,chi,eng,remarks,grades?,pdfGrades?}] */
+function apiUpsertStudents(list, opts) {
+  var email = auth_();
+  opts = opts || {};
+  return withLock_(function () {
+    var t = readTable_(SHEET.STUDENTS);
+    var h = t.headers, sh = t.sheet;
+    var index = {};
+    t.rows.forEach(function (r, i) { index[sKey_(r[col_(h, '學年')], r[col_(h, '班別')], r[col_(h, '學號')])] = i; });
+    var added = 0, updated = 0, skipped = 0, appendRows = [];
+    (list || []).forEach(function (s) {
+      var year = normYear_(s.year);
+      var cls = String(s.cls || '').trim().toUpperCase();
+      var no = String(s.no || '').trim().replace(/^0+(?=\d)/, '');
+      if (!cls || !no || !s.chi) { skipped++; return; }
+      var k = sKey_(year, cls, no);
+      var row;
+      if (index.hasOwnProperty(k)) {
+        if (opts.skipExisting) { skipped++; return; }
+        row = t.rows[index[k]].slice();
+      } else {
+        row = h.map(function () { return ''; });
+      }
+      row[col_(h, '學年')] = year; row[col_(h, '班別')] = cls; row[col_(h, '學號')] = no;
+      row[col_(h, '中文姓名')] = safe_(s.chi);
+      if (s.eng !== undefined) row[col_(h, '英文姓名')] = safe_(s.eng);
+      if (s.reg !== undefined) row[col_(h, '註冊編號')] = safe_(String(s.reg).trim());
+      if (s.strn !== undefined) row[col_(h, 'STRN')] = safe_(String(s.strn).trim().toUpperCase());
+      if (s.remarks !== undefined) row[col_(h, '備註')] = safe_(s.remarks);
+      if (s.grades) SUBJECTS.forEach(function (sub) {
+        var i = h.indexOf(sub[1]);
+        if (i >= 0) row[i] = safe_(s.grades[sub[0]] || '');
+      });
+      if (s.pdfGrades) row[col_(h, '成績表原始資料(JSON)')] = JSON.stringify(s.pdfGrades);
+      row[col_(h, '修改者')] = email; row[col_(h, '修改時間')] = now_();
+      if (index.hasOwnProperty(k)) {
+        sh.getRange(index[k] + 2, 1, 1, row.length).setValues([row]);
+        t.rows[index[k]] = row; updated++;
+      } else {
+        appendRows.push(row); index[k] = -1; added++;
+      }
+    });
+    if (appendRows.length) {
+      var start = sh.getLastRow() + 1;
+      sh.getRange(start, 1, appendRows.length, h.length).setNumberFormat('@').setValues(appendRows);
+    }
+    log_('更新學生名單', '新增 ' + added + '、更新 ' + updated + '、略過 ' + skipped);
+    return { added: added, updated: updated, skipped: skipped };
+  });
+}
+
+/** 只更新某學生的成績（成績下拉選單即時儲存用） */
+function apiSaveGrades(year, cls, no, grades) {
+  auth_();
+  var s = findStudent_(year, cls, no);
+  if (!s) throw new Error('找不到學生');
+  return apiUpsertStudents([{ year: year, cls: cls, no: no, chi: s.chi, grades: grades }]);
+}
+
+function findStudent_(year, cls, no) {
+  var t = readTable_(SHEET.STUDENTS), h = t.headers, k = sKey_(year, cls, no);
+  for (var i = 0; i < t.rows.length; i++) {
+    var r = t.rows[i];
+    if (sKey_(r[col_(h, '學年')], r[col_(h, '班別')], r[col_(h, '學號')]) === k) return rowToStudent_(h, r);
+  }
+  return null;
+}
+
+function apiDeleteStudent(year, cls, no) {
+  auth_();
+  var k = sKey_(year, cls, no);
+  return withLock_(function () {
+    var a = deleteRowsWhere_(SHEET.STUDENTS, function (h, r) { return sKey_(r[col_(h, '學年')], r[col_(h, '班別')], r[col_(h, '學號')]) === k; });
+    var b = deleteRowsWhere_(SHEET.RECORDS, function (h, r) { return sKey_(r[col_(h, '學年')], r[col_(h, '班別')], r[col_(h, '學號')]) === k; });
+    log_('刪除學生', k + '（紀錄 ' + b + '）');
+    return { students: a, records: b };
+  });
+}
+
+/** 刪除整班：同時刪除該班所有面談紀錄 */
+function apiDeleteClass(year, cls) {
+  auth_();
+  year = normYear_(year); cls = String(cls).trim().toUpperCase();
+  return withLock_(function () {
+    var a = deleteRowsWhere_(SHEET.STUDENTS, function (h, r) { return r[col_(h, '學年')] === year && String(r[col_(h, '班別')]).toUpperCase() === cls; });
+    var b = deleteRowsWhere_(SHEET.RECORDS, function (h, r) { return r[col_(h, '學年')] === year && String(r[col_(h, '班別')]).toUpperCase() === cls; });
+    deleteRowsWhere_(SHEET.CLASS_CFG, function (h, r) { return r[col_(h, '學年')] === year && String(r[col_(h, '班別')]).toUpperCase() === cls; });
+    log_('刪除班別', year + ' ' + cls + '：學生 ' + a + '、紀錄 ' + b);
+    return { students: a, records: b };
+  });
+}
+
+/** 刪除符合條件的列（由下而上，連續區塊一次刪除） */
+function deleteRowsWhere_(name, pred) {
+  var t = readTable_(name), n = 0;
+  for (var i = t.rows.length - 1; i >= 0; i--) {
+    if (pred(t.headers, t.rows[i])) {
+      var end = i, start = i;
+      while (start - 1 >= 0 && pred(t.headers, t.rows[start - 1])) start--;
+      t.sheet.deleteRows(start + 2, end - start + 1);
+      n += end - start + 1;
+      i = start;
+    }
+  }
+  return n;
+}
+
+/* ───────────────────────── 面談紀錄 ───────────────────────── */
+
+function apiSaveRecord(rec) {
+  var email = auth_();
+  if (!rec || !rec.year || !rec.cls || !rec.no) throw new Error('紀錄缺少學年／班別／學號');
+  return withLock_(function () {
+    var t = readTable_(SHEET.RECORDS), h = t.headers, sh = t.sheet;
+    var idCol = col_(h, '紀錄ID');
+    var rowIdx = -1;
+    if (rec.id) for (var i = 0; i < t.rows.length; i++) if (t.rows[i][idCol] === rec.id) { rowIdx = i; break; }
+    var ts = now_();
+    var out = {};
+    RECORD_COLS.forEach(function (c) { out[c[0]] = rec[c[0]]; });
+    out.year = normYear_(rec.year);
+    out.cls = String(rec.cls).trim().toUpperCase();
+    out.no = String(rec.no).trim();
+    if (rowIdx < 0) {
+      out.id = 'R' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+      out.createdBy = rec.createdBy && rec.importing ? rec.createdBy : email;
+      out.createdAt = rec.createdAt && rec.importing ? rec.createdAt : ts;
+    } else {
+      out.createdBy = t.rows[rowIdx][col_(h, '建立者')];
+      out.createdAt = t.rows[rowIdx][col_(h, '建立時間')];
+    }
+    out.updatedBy = email; out.updatedAt = ts;
+    var row = h.map(function (name) {
+      var c = RECORD_COLS.filter(function (x) { return x[1] === name; })[0];
+      if (!c) return rowIdx >= 0 ? t.rows[rowIdx][h.indexOf(name)] : '';
+      var v = out[c[0]];
+      if (c[0] === 'grades') return JSON.stringify(v || {});
+      return safe_(v);
+    });
+    if (rowIdx >= 0) sh.getRange(rowIdx + 2, 1, 1, row.length).setValues([row]);
+    else sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setNumberFormat('@').setValues([row]);
+    log_(rowIdx >= 0 ? '修改面談紀錄' : '新增面談紀錄', out.id + ' ' + out.year + ' ' + out.cls + '-' + out.no + ' ' + (out.chi || ''));
+    return rowToRecord_(h, row.map(function (v) { return String(v).replace(/^'/, ''); }));
+  });
+}
+
+function apiDeleteRecord(id) {
+  auth_();
+  return withLock_(function () {
+    var n = deleteRowsWhere_(SHEET.RECORDS, function (h, r) { return r[col_(h, '紀錄ID')] === id; });
+    log_('刪除面談紀錄', id);
+    return n;
+  });
+}
+
+/* ───────────────────────── 備份 / 還原 / V5 匯入 ───────────────────────── */
+
+/** 匯出全部資料（JSON 備份，version 6） */
+function apiExportBackup() {
+  auth_();
+  var d = apiBootstrap();
+  log_('匯出備份', '學生 ' + d.students.length + '、紀錄 ' + d.records.length);
+  return { app: APP_TITLE, version: 6, exportedAt: now_(), timeZone: TZ, years: d.years, students: d.students, records: d.records, classDefaults: d.classDefaults || [] };
+}
+
+/**
+ * 還原：payload 為已轉換成 V6 格式的 {years, students, records}（前端負責把 V5 備份轉換）。
+ * mode = 'merge'（合併：同鍵覆蓋，其他保留）或 'replace'（先清空所選學年）。
+ */
+function apiImportBackup(payload, mode) {
+  var email = auth_();
+  if (!payload || !payload.students) throw new Error('備份格式不正確');
+  var years = (payload.years || []).map(normYear_);
+  if (mode === 'replace') {
+    withLock_(function () {
+      years.forEach(function (y) {
+        deleteRowsWhere_(SHEET.STUDENTS, function (h, r) { return r[col_(h, '學年')] === y; });
+        deleteRowsWhere_(SHEET.RECORDS, function (h, r) { return r[col_(h, '學年')] === y; });
+      });
+    });
+  }
+  years.forEach(function (y) { apiAddYear(y); });
+  if (mode === 'replace') {
+    withLock_(function () {
+      years.forEach(function (y) {
+        deleteRowsWhere_(SHEET.CLASS_CFG, function (h, r) { return r[col_(h, '學年')] === y; });
+      });
+    });
+  }
+  (payload.classDefaults || []).forEach(function (d) {
+    if (d && d.year && d.cls) apiSaveClassDefault(d.year, d.cls, d.teacher || '');
+  });
+  var res = apiUpsertStudents(payload.students, {});
+  // 紀錄：以 紀錄ID 去重；批量寫入
+  var count = withLock_(function () {
+    var t = readTable_(SHEET.RECORDS), h = t.headers, sh = t.sheet;
+    var have = {};
+    t.rows.forEach(function (r) { have[r[col_(h, '紀錄ID')]] = 1; });
+    var rows = [];
+    (payload.records || []).forEach(function (rec) {
+      if (rec.id && have[rec.id]) return; // 已存在 → 略過，避免重複匯入
+      var id = rec.id ? String(rec.id).slice(0, 40) : '';
+      var o = {};
+      RECORD_COLS.forEach(function (c) { o[c[0]] = rec[c[0]]; });
+      o.id = id || ('R' + Utilities.getUuid().replace(/-/g, '').slice(0, 16));
+      o.year = normYear_(o.year);
+      o.createdBy = o.createdBy || (email + '（匯入）');
+      o.createdAt = o.createdAt || now_();
+      o.updatedBy = email; o.updatedAt = now_();
+      rows.push(h.map(function (name) {
+        var c = RECORD_COLS.filter(function (x) { return x[1] === name; })[0];
+        if (!c) return '';
+        return c[0] === 'grades' ? JSON.stringify(o.grades || {}) : safe_(o[c[0]]);
+      }));
+      have[o.id] = 1;
+    });
+    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, h.length).setNumberFormat('@').setValues(rows);
+    return rows.length;
+  });
+  log_('還原 / 匯入備份', '模式 ' + mode + '；學生 新增' + res.added + ' 更新' + res.updated + '；紀錄 ' + count);
+  return { students: res, records: count };
+}
+
+/* ───────────────────────── 其他 ───────────────────────── */
+
+/** 前端在重要操作（例如列印、匯出 Word）時記錄 */
+function apiLog(action, detail) {
+  auth_();
+  log_(String(action).slice(0, 50), detail);
+  return true;
+}
+
+;return {doGet,include,setup,studentHeaders_,ensureSheet_,activeEmail_,isAuthorized_,auth_,ss_,now_,defaultYear_,safe_,unsafe_,withLock_,log_,readTable_,col_,normYear_,sKey_,rowToStudent_,rowToRecord_,apiBootstrap,listClassDefaults_,apiSaveClassDefault,apiApplyClassTeacher,listYears_,apiAddYear,apiDeleteYear,apiUpsertStudents,apiSaveGrades,findStudent_,apiDeleteStudent,apiDeleteClass,deleteRowsWhere_,apiSaveRecord,apiDeleteRecord,apiExportBackup,apiImportBackup,apiLog};})();</script>
+<script>// ── GitHub Pages／本機版：資料只存此瀏覽器 localStorage ──
+(function(){
+  var KEY = 'hw6_pages_sheets_v1';
+  window.__pagesRestore = function(){
+    try {
+      var raw = localStorage.getItem(KEY); if (!raw) return false;
+      var d = JSON.parse(raw), ss = SpreadsheetApp.getActiveSpreadsheet();
+      Object.keys(d).forEach(function(n){ var sh = ss.getSheetByName(n) || ss.insertSheet(n); sh.data = d[n]; });
+      return true;
+    } catch (e) { console.warn('restore failed', e); return false; }
+  };
+  window.__pagesSave = function(){
+    try {
+      var o = {};
+      Object.keys(window.__sheets).forEach(function(n){ o[n] = window.__sheets[n].data; });
+      localStorage.setItem(KEY, JSON.stringify(o));
+    } catch (e) { console.warn('save failed', e); }
+  };
+  window.__pagesClear = function(){
+    if (!confirm('清除本機全部資料？\n\n此瀏覽器內的學生名單、面談紀錄、班別設定都會刪除，而且無法復原。\n（不影響其他電腦／瀏覽器）')) return;
+    try { localStorage.removeItem(KEY); localStorage.removeItem('hw6_year'); localStorage.removeItem('hw6_pdfTerm'); } catch (e) {}
+    location.reload();
+  };
+  window.__user = '本機教師';
+  var orig = google.script.run;
+  google.script.run = new Proxy({}, { get: function(_, p){
+    if (p === 'withSuccessHandler') return function(f){ return orig.withSuccessHandler(function(x){ window.__pagesSave(); f && f(x); }); };
+    if (p === 'withFailureHandler') return function(f){ return orig.withFailureHandler(f); };
+    return function(){ var a = arguments; orig.withSuccessHandler(function(){ window.__pagesSave(); })[p].apply(null, a); };
+  }});
+})();
+</script>
+<script>// ── 首次開啟：只建空學年，不放示範學生 ──
+(function(){
+  var restored = window.__pagesRestore();
+  var S = window.__srv;
+  S.setup();
+  window.__user = '本機教師';
+  try {
+    var t = window.__sheets['授權老師'];
+    var have = (t.data || []).some(function(r, i){ return i > 0 && String(r[0] || '').toLowerCase() === '本機教師'; });
+    if (!have) t.appendRow(['本機教師', '本機使用', 'GitHub Pages／本機版']);
+  } catch (e) {}
+  if (restored) return;
+  var d = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Hong_Kong', year: 'numeric', month: '2-digit' }).format(new Date());
+  var y0 = +d.slice(0, 4), m = +d.slice(5, 7), s = m >= 8 ? y0 : y0 - 1;
+  var Y = s + '-' + String(s + 1).slice(-2);
+  try { S.apiAddYear(Y); } catch (e) {}
+  window.__pagesSave();
+})();
+</script>
+
+<base target="_top">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>漢華中學　升學及就業輔導組｜中六個人輔導系統 V6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&display=swap" rel="stylesheet">
+<script>
+  // 盡早套用深淺模式，避免閃爍
+  try {
+    var t = localStorage.getItem('hw6_theme');
+    if (t === 'dark' || (!t && window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches)) document.documentElement.classList.add('dark');
+  } catch (e) {}
+</script>
+<style>
+:root{
+  --app-chrome:56px; /* 頂欄高度；預覽版橫額會覆寫 */
+  --bg:#f4f6fa; --bg2:#ffffff; --bg3:#eef2f8; --border:#dde3ee; --border2:#c8d1e0;
+  --text:#1d2433; --text2:#3f4a5e; --text3:#6b7690;
+  --brand:#1f3a5f; --brand2:#2d5a8e; --accent:#b8892b; --accent2:#9a7020; --accentbg:#fbf3e2;
+  --green:#1e8a4c; --greenbg:#e5f5ec; --red:#c0392b; --redbg:#fdecea; --orange:#c76a00; --orangebg:#fff3e0; --blue:#2463b8; --bluebg:#e8f0fc;
+  --shadow:0 2px 10px rgba(20,40,80,.07); --radius:12px; --radius-sm:8px;
+  --font:"Noto Sans TC","Microsoft JhengHei","微軟正黑體","PingFang TC","Heiti TC",system-ui,sans-serif;
+  --mono:"JetBrains Mono","Consolas","SFMono-Regular",monospace;
+  /* 等級顏色（每級不同） */
+  --g5ss:#7b2cbf; --g5s:#c2185b; --g5:#b8892b; --g4:#1e8a4c; --g3:#2463b8; --g2:#c76a00; --g1:#c0392b; --gU:#7d8597;
+}
+html.dark{
+  --bg:#11151d; --bg2:#1a202b; --bg3:#232b38; --border:#2c3545; --border2:#3a4558;
+  --text:#e8ecf3; --text2:#c2cad8; --text3:#8a95a9;
+  --brand:#9cc0f0; --brand2:#7aa7e6; --accent:#e0b456; --accent2:#f0c873; --accentbg:#2d2614;
+  --green:#4cc282; --greenbg:#15301f; --red:#ef6b5e; --redbg:#3a1a17; --orange:#f0a04b; --orangebg:#35260f; --blue:#7aa7e6; --bluebg:#18263b;
+  --shadow:0 2px 12px rgba(0,0,0,.35);
+  --g5ss:#c39bff; --g5s:#ff7eb3; --g5:#e0b456; --g4:#4cc282; --g3:#7aa7e6; --g2:#f0a04b; --g1:#ef6b5e; --gU:#8a95a9;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:15px;line-height:1.6;-webkit-text-size-adjust:100%}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+.hidden{display:none!important}
+a{color:var(--blue)}
+
+/* ── 頂部列 ── */
+.topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--brand);color:#fff;box-shadow:var(--shadow)}
+html.dark .topbar{background:#16233a}
+.topbar .title{display:flex;flex-direction:column;line-height:1.25;min-width:0}
+.topbar .t1{font-weight:700;font-size:16px;letter-spacing:1px;white-space:nowrap}
+.topbar .t2{font-size:12px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .spacer{flex:1}
+.tb-btn{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;white-space:nowrap}
+.tb-btn:hover{background:rgba(255,255,255,.22)}
+.tb-btn.active{background:#fff;color:var(--brand)}
+html.dark .tb-btn.active{color:#16233a}
+.tb-user{font-size:12px;opacity:.85;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu-btn{display:none}
+.menu-only{display:none!important}
+
+/* ── 版面 ── */
+.shell{display:flex;height:calc(100vh - 56px)}
+.sidebar{width:310px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+.main{flex:1;overflow-y:auto;min-width:0}
+.scrim{display:none}
+
+.sb-sec{padding:12px 14px;border-bottom:1px solid var(--border)}
+.year-bar{display:flex;gap:6px;align-items:center}
+.year-bar label{font-size:13px;color:var(--text3)}
+.select,.input,.textarea{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius-sm);padding:8px 10px;width:100%;outline:none;transition:border .15s, box-shadow .15s}
+.select:focus,.input:focus,.textarea:focus{border-color:var(--brand2);box-shadow:0 0 0 3px rgba(45,90,142,.18)}
+.textarea{min-height:84px;resize:vertical;line-height:1.7}
+.year-bar .select{flex:1;width:auto}
+
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;border:1px solid var(--border2);border-radius:999px;overflow:hidden;background:var(--bg2)}
+.chip button{border:none;background:transparent;padding:4px 10px;cursor:pointer;font-size:13px}
+.chip .x{padding:4px 8px 4px 2px;color:var(--text3)}
+.chip .x:hover{color:var(--red)}
+.chip.active{background:var(--brand);border-color:var(--brand)}
+.chip.active button{color:#fff}
+html.dark .chip.active button{color:#11151d}
+.chip.all{font-weight:600}
+
+.progress{font-size:12px;color:var(--text3)}
+.progress .track{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin:4px 0}
+.progress .fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));transition:width .3s}
+.progress .row{display:flex;justify-content:space-between}
+
+.student-list{flex:1;overflow-y:auto;min-height:0}
+.si{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;position:relative}
+.si:hover{background:var(--bg3)}
+.si.active{background:var(--accentbg);box-shadow:inset 3px 0 0 var(--accent)}
+.si .dot{width:9px;height:9px;border-radius:50%;background:var(--border2);flex-shrink:0}
+.si .dot.done{background:var(--green)}
+.si .nm{font-weight:600}
+.si .en{font-size:12px;color:var(--text3)}
+.si .meta{margin-left:auto;text-align:right;font-family:var(--mono);font-size:12px;color:var(--text3)}
+.si .cnt{font-size:11px;color:var(--green)}
+.si .del{opacity:0;border:none;background:none;color:var(--text3);cursor:pointer;font-size:16px;padding:0 4px}
+.si:hover .del{opacity:1}
+.si .del:hover{color:var(--red)}
+.sb-footer{padding:12px 14px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.sb-footer .wide{grid-column:1/-1}
+
+/* ── 按鈕 ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border-radius:var(--radius-sm);padding:8px 14px;border:1px solid var(--border2);background:var(--bg2);cursor:pointer;white-space:nowrap;transition:background .15s,border .15s}
+.btn:hover{background:var(--bg3)}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+html.dark .btn.primary{color:#11151d}
+.btn.primary:hover{filter:brightness(1.1)}
+.btn.accent{background:var(--accent);border-color:var(--accent);color:#fff}
+html.dark .btn.accent{color:#11151d}
+.btn.danger{color:var(--red);border-color:var(--red)}
+.btn.sm{padding:5px 10px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── 主區 ── */
+.mhead{position:sticky;top:0;z-index:5;background:var(--bg);display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:16px 24px 10px;border-bottom:1px solid var(--border)}
+.mhead .nm{font-size:22px;font-weight:700}
+.mhead .sub{font-size:13px;color:var(--text3)}
+.mhead .acts{margin-left:auto;display:flex;flex-wrap:wrap;gap:8px}
+.tabs{display:flex;gap:4px;padding:0 24px;border-bottom:1px solid var(--border);background:var(--bg);overflow-x:auto}
+.tab{padding:10px 14px;cursor:pointer;border-bottom:2px solid transparent;color:var(--text3);white-space:nowrap;border-top:none;border-left:none;border-right:none;background:none}
+.tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.view{padding:18px 24px 60px;max-width:1100px}
+
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px}
+.card-h{display:flex;align-items:center;gap:8px;padding:12px 18px;border-bottom:1px solid var(--border);font-weight:700}
+.card-h .r{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;font-weight:400}
+.card-b{padding:16px 18px}
+
+.profile{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
+.profile .big{font-size:24px;font-weight:700}
+.profile .meta{display:flex;flex-wrap:wrap;gap:14px;font-size:14px;color:var(--text2);margin-top:4px}
+.badge{display:inline-block;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600}
+.badge.done{background:var(--greenbg);color:var(--green)}
+.badge.pending{background:var(--bg3);color:var(--text3)}
+
+.modebar{border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:14px}
+.modebar.new{background:var(--bluebg);color:var(--blue);border:1px solid var(--blue)}
+.modebar.edit{background:var(--accentbg);color:var(--accent2);border:1px solid var(--accent)}
+.modebar .r{margin-left:auto;color:var(--text3);font-size:13px}
+
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.grid2 .full{grid-column:1/-1}
+.fg label{display:block;font-size:13px;color:var(--text3);margin-bottom:4px}
+.fg label .tag{font-size:11px;color:var(--accent2);margin-left:4px}
+
+.grade-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:8px}
+.gi{border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;background:var(--bg)}
+.gi .s{font-size:13px;color:var(--text2);font-weight:600}
+.gi select{width:100%;border:none;background:transparent;font-family:var(--mono);font-size:18px;font-weight:700;padding:2px 0;cursor:pointer;outline:none}
+.gi select option{color:var(--text);background:var(--bg2)}
+.gi .v{font-family:var(--mono);font-size:20px;font-weight:700}
+.gsub{font-size:12px;color:var(--text3);margin:10px 0 6px}
+.c-5ss{color:var(--g5ss)!important}.c-5s{color:var(--g5s)!important}.c-5{color:var(--g5)!important}.c-4{color:var(--g4)!important}
+.c-3{color:var(--g3)!important}.c-2{color:var(--g2)!important}.c-1{color:var(--g1)!important}.c-U{color:var(--gU)!important}
+.c-ok{color:var(--green)!important}.c-no{color:var(--red)!important}.c-empty{color:var(--text3)!important}
+
+.dse{margin-top:16px;border:1px dashed var(--border2);border-radius:var(--radius-sm);padding:12px 14px;background:var(--bg)}
+.dse .top{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.dse .total{font-size:36px;font-weight:800;font-family:var(--mono);color:var(--accent)}
+.dse .lbl{font-size:13px;color:var(--text3)}
+.req{display:inline-block;border-radius:6px;padding:3px 8px;font-size:13px;margin-top:2px}
+.req.pass{background:var(--greenbg);color:var(--green)}
+.req.fail{background:var(--redbg);color:var(--red)}
+.req.na{background:var(--bg3);color:var(--text3)}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.tagx{font-size:12px;border:1px solid var(--border2);border-radius:999px;padding:2px 8px;color:var(--text3)}
+.tagx.used{border-color:var(--accent);color:var(--accent2);background:var(--accentbg)}
+.note{font-size:13px;color:var(--text3);margin-top:8px}
+
+/* 歷史 */
+.hc{border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:10px;background:var(--bg2)}
+.hc.cur{border-color:var(--accent)}
+.hc-h{display:flex;gap:12px;align-items:center;padding:10px 14px;cursor:pointer}
+.hc-n{width:30px;height:30px;border-radius:50%;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
+html.dark .hc-n{color:#11151d}
+.hc-b{display:none;padding:4px 14px 14px;border-top:1px solid var(--border)}
+.hc.open .hc-b{display:block}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:4px 12px;font-size:14px;margin-top:8px}
+.kv .k{color:var(--text3)}
+.kv .v{white-space:pre-wrap;word-break:break-word}
+
+/* 比較 */
+.cmp-wrap{overflow-x:auto}
+table.cmp{border-collapse:collapse;min-width:100%;font-size:14px}
+table.cmp th,table.cmp td{border:1px solid var(--border);padding:6px 10px;vertical-align:top;text-align:left;white-space:pre-wrap;min-width:160px}
+table.cmp th{background:var(--bg3);position:sticky;top:0}
+table.cmp td.k{font-weight:600;color:var(--text2);background:var(--bg3);min-width:120px;white-space:nowrap;position:sticky;left:0}
+table.cmp td.chg{background:var(--accentbg)}
+
+/* 空狀態 */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:70vh;text-align:center;padding:24px;color:var(--text2)}
+.empty .ic{font-size:46px}
+.empty h2{margin:8px 0}
+.steps{text-align:left;line-height:2.1}
+.steps b{color:var(--accent2)}
+
+/* Modal */
+.ov{position:fixed;inset:0;background:rgba(10,15,25,.55);z-index:100;display:flex;align-items:center;justify-content:center;padding:16px}
+.modal{background:var(--bg2);border-radius:var(--radius);box-shadow:0 20px 60px rgba(0,0,0,.35);width:min(620px,100%);max-height:92vh;overflow:auto;padding:22px}
+.modal.wide{width:min(1000px,100%)}
+.modal h2{margin:0 0 8px;font-size:19px}
+.modal p{color:var(--text2);margin:6px 0}
+.modal .acts{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:16px}
+.pre{font-family:var(--mono);font-size:13px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;white-space:pre}
+.dropzone{border:2px dashed var(--border2);border-radius:var(--radius);padding:28px;text-align:center;cursor:pointer;margin-top:10px}
+.dropzone.over{border-color:var(--accent);background:var(--accentbg)}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th,.tbl td{border-bottom:1px solid var(--border);padding:5px 6px;text-align:left}
+.warn{color:var(--orange)}
+.ok{color:var(--green)}
+.err{color:var(--red)}
+.export-opts{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.preview-box{margin-top:12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:#fff;overflow:auto;max-height:52vh;padding:12px}
+
+/* Toast / Loading */
+.toast{position:fixed;right:18px;bottom:18px;z-index:200;background:var(--bg2);border:1px solid var(--border2);border-left:4px solid var(--brand);box-shadow:var(--shadow);border-radius:var(--radius-sm);padding:10px 16px;max-width:min(420px,90vw);transform:translateY(20px);opacity:0;transition:all .25s;pointer-events:none}
+.toast.show{transform:none;opacity:1}
+.toast.success{border-left-color:var(--green)}
+.toast.error{border-left-color:var(--red)}
+.loading{position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:rgba(10,15,25,.35)}
+.spinner{width:38px;height:38px;border:4px solid rgba(255,255,255,.4);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.saving{font-size:12px;opacity:.9}
+
+/* JUPAS 參考 */
+.jp table{width:100%;border-collapse:collapse;font-size:14px}
+.jp th,.jp td{border:1px solid var(--border);padding:6px 9px;text-align:left;vertical-align:top}
+.jp th{background:var(--bg3)}
+.jp .src{font-size:12px;color:var(--text3);word-break:break-all}
+.flag{color:var(--orange);font-weight:600}
+
+/* ── 紀錄表（列印／預覽共用）── */
+.form-page{font-family:"PMingLiU","新細明體","MingLiU","Noto Serif TC","Times New Roman",serif;color:#000;background:#fff;font-size:12pt;width:170mm;margin:0 auto}
+.form-page .hd{text-align:center;font-weight:bold;line-height:1.5;margin:0}
+.form-page .hd-gap{height:1.5em}
+.form-page table{width:100%;border-collapse:collapse;table-layout:fixed}
+.form-page td{border:0.75pt solid #000;padding:1pt 5.4pt;line-height:1.5;vertical-align:top;word-break:break-word;white-space:pre-wrap}
+.form-page td.c{text-align:center}
+.form-page td.vc{vertical-align:middle}
+.form-page td.sh{background:#BFBFBF;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.form-page td.g{text-align:center;font-weight:bold}
+.form-page tr.tall td{height:5.2em}
+.form-page tr.mid td{height:2.6em}
+
+#printArea{display:none}
+
+/* ── 響應式 ── */
+@media (max-width: 1024px){
+  .sidebar{width:280px}
+  .view{padding:14px 16px 60px}
+  .mhead{padding:12px 16px 8px}
+  .tabs{padding:0 16px}
+}
+/* iPad／觸控：加大可點範圍（約 ≥44px） */
+@media (max-width: 1024px), (hover:none), (pointer:coarse){
+  .chip button{padding:10px 14px;min-height:44px;font-size:14px}
+  .chip .x{padding:10px 12px;min-width:44px;min-height:44px}
+  .btn.sm{padding:10px 14px;min-height:44px;font-size:14px}
+  .btn{min-height:44px}
+  .tb-btn{min-height:44px;padding:8px 14px}
+  .menu-btn{min-width:44px;min-height:44px;justify-content:center}
+  .year-bar .btn{min-width:44px;min-height:44px;padding:8px}
+  .si{padding:14px 14px;min-height:56px}
+  .si .del{opacity:1;min-width:44px;min-height:44px;font-size:20px} /* 觸控無 hover，刪除鈕常顯 */
+  .tabs button{min-height:44px;padding:10px 14px}
+  .input,.select,.textarea{min-height:44px;padding:10px 12px;font-size:16px} /* 16px 避免 iOS 自動放大 */
+  .gi select{font-size:20px;min-height:40px;padding:6px 0}
+  .sb-footer{gap:8px}
+  .sb-footer .btn.sm{flex:1 1 calc(50% - 8px)}
+  #btnOpenList{min-height:48px;width:100%;margin:8px 0;font-size:16px}
+}
+@media (max-width: 860px){
+  .menu-btn{display:inline-flex}
+  .menu-only{display:inline-flex!important}
+  .sidebar{position:fixed;top:var(--app-chrome);bottom:0;left:0;z-index:40;width:min(340px,88vw);transform:translateX(-105%);transition:transform .25s;box-shadow:var(--shadow)}
+  body.drawer .sidebar{transform:none}
+  body.drawer .scrim{display:block;position:fixed;inset:var(--app-chrome) 0 0 0;background:rgba(0,0,0,.35);z-index:35}
+  .tb-user{display:none}
+  .mhead .acts{width:100%;margin-left:0}
+  .mhead .acts .btn{flex:1 1 auto}
+}
+@media (max-width: 640px){
+  body{font-size:15px}
+  .topbar .t2{display:none}
+  .grid2{grid-template-columns:1fr}
+  .kv{grid-template-columns:1fr}
+  .kv .k{margin-top:6px}
+  .export-opts{grid-template-columns:1fr}
+  .grade-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .modal{padding:16px}
+  .tb-label{display:none}
+}
+
+/* ── 列印 ── */
+@page{size:A4;margin:20mm}
+@media print{
+  body{background:#fff!important}
+  body.printing > *:not(#printArea){display:none!important}
+  body.printing #printArea{display:block!important}
+  .form-page{width:auto;margin:0}
+  .form-page + .form-page{page-break-before:always;break-before:page}
+  .form-page table, .form-page tr{page-break-inside:auto}
+  .form-page tr{break-inside:avoid}
+}
+.class-teacher-hint{margin-top:8px;font-size:13px;color:var(--text2);line-height:1.5;padding:6px 8px;background:var(--card2,var(--bg2,#f4f6fa));border-radius:8px;border:1px solid var(--border)}
+.class-teacher-hint .btn{padding:2px 8px;font-size:12px}
+</style>
+
+</head>
+<body>
+
+<header class="topbar">
+  <button class="tb-btn menu-btn" id="menuBtn" aria-label="開啟學生名單">☰</button>
+  <div class="title">
+    <span class="t1">漢華中學</span>
+    <span class="t2">升學及就業輔導組 · 中六個人輔導系統 V6</span>
+  </div>
+  <div class="spacer"></div>
+  <button class="tb-btn active" id="navStudents" data-nav="students">👥 <span class="tb-label">學生</span></button>
+  <button class="tb-btn" id="navJupas" data-nav="jupas">🎓 <span class="tb-label">JUPAS 參考</span></button>
+  <span class="saving" id="savingInd"></span>
+  <span class="tb-user" id="userEmail" title="目前登入帳戶"></span>
+  <button class="tb-btn" id="themeBtn" title="切換深色／淺色模式">🌙</button>
+</header>
+
+<div class="shell" id="app">
+  <div class="scrim" id="scrim"></div>
+  <!-- ─── 側欄 ─── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-sec">
+      <div class="year-bar">
+        <label for="yearSelect">學年</label>
+        <select class="select" id="yearSelect"></select>
+        <button class="btn sm" id="btnAddYear" title="新增學年">＋</button>
+        <button class="btn sm" id="btnDelYear" title="刪除目前學年">🗑</button>
+      </div>
+    </div>
+    <div class="sb-sec">
+      <input class="input" id="searchInput" type="search" placeholder="搜尋中文／英文姓名、班別、學號…">
+    </div>
+    <div class="sb-sec">
+      <div class="chips" id="classChips"></div>
+      <div id="classTeacherHint" class="class-teacher-hint"></div>
+    </div>
+    <div class="sb-sec progress" id="progressWrap">
+      <div class="row"><span>面談進度</span><span id="progressText">0 / 0</span></div>
+      <div class="track"><div class="fill" id="progressFill" style="width:0"></div></div>
+      <div id="progressClasses"></div>
+    </div>
+    <div class="student-list" id="studentList"></div>
+    <div class="sb-footer">
+      <button class="btn primary wide" data-open="importModal">＋ 批量輸入學生名單</button>
+      <button class="btn wide" data-open="pdfModal">📄 上載成績表 PDF</button>
+      <button class="btn sm" id="btnClassTeacher">👤 班別預設負責老師</button>
+      <button class="btn sm" id="btnClassExport">📁 全班匯出</button>
+      <button class="btn sm" data-open="backupModal">💾 備份／還原</button>
+      <button class="btn sm" type="button" id="btnClearLocal" title="刪除此瀏覽器內全部資料">🧹 清除本機資料</button>
+    </div>
+  </aside>
+
+  <!-- ─── 主區 ─── -->
+  <main class="main" id="main">
+    <!-- 學生視圖 -->
+    <section id="pageStudents">
+      <div class="empty" id="emptyState">
+        <div class="ic">📋</div>
+        <h2>開始本學年個人輔導</h2>
+        <p class="note" style="margin:0 auto 8px;max-width:460px">資料只保存在<strong>此電腦／此瀏覽器</strong>，不會上傳。名單格式：<code>班別 學號 中文姓名 英文姓名 註冊編號 STRN</code>（後三項可省）</p>
+        <div class="steps">
+          <div><b>步驟 1</b>　點擊「＋ 批量輸入學生名單」貼上本學年中六名單</div>
+          <div><b>步驟 2</b>　（可選）上載中五成績表 PDF，自動配對成績</div>
+          <div><b>步驟 3</b>　從左邊名單選擇學生，開始面談紀錄／匯出 Word</div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;justify-content:center">
+          <button class="btn primary" data-open="importModal">＋ 輸入學生名單</button>
+          <button class="btn" data-open="pdfModal">📄 上載成績表</button>
+          <button class="btn menu-only" id="btnOpenList">👥 開啟學生名單</button>
+        </div>
+      </div>
+
+      <div class="hidden" id="studentContent">
+        <div class="mhead">
+          <div>
+            <div class="nm" id="hdrName">—</div>
+            <div class="sub" id="hdrSub">個人輔導紀錄表 中六</div>
+          </div>
+          <div class="acts">
+            <button class="btn" id="btnNew">＋ 新增面談</button>
+            <button class="btn" id="btnExport">🖨 匯出紀錄表</button>
+            <button class="btn primary" id="btnSave">💾 儲存紀錄</button>
+          </div>
+        </div>
+        <nav class="tabs" id="tabs">
+          <button class="tab active" data-tab="counselling">個人輔導</button>
+          <button class="tab" data-tab="grades">成績資料</button>
+          <button class="tab" data-tab="history">面談記錄</button>
+          <button class="tab" data-tab="compare">比較</button>
+        </nav>
+
+        <!-- 個人輔導 -->
+        <div class="view" id="tab-counselling">
+          <div class="card"><div class="card-b profile">
+            <div style="flex:1;min-width:200px">
+              <div class="big" id="pfChi">—</div>
+              <div style="color:var(--text3)" id="pfEng"></div>
+              <div class="meta">
+                <span>班級：<b id="pfCls">—</b></span>
+                <span>學號：<b id="pfNo">—</b></span>
+                <span id="pfIds" class="note" style="margin:0"></span>
+                <span>中五成績：<b id="pfSum">—</b></span>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+              <span class="badge pending" id="pfBadge">未面談</span>
+            </div>
+          </div></div>
+
+          <div class="modebar new" id="modeBar"><b id="modeText">新增面談紀錄</b><span class="r" id="modeCount"></span></div>
+
+          <div class="card">
+            <div class="card-h">🗓 會面基本資料</div>
+            <div class="card-b grid2">
+              <div class="fg"><label for="f-date">會面日期</label><input class="input" type="date" id="f-date"></div>
+              <div class="fg"><label for="f-teacher">負責老師</label><input class="input" id="f-teacher" placeholder="老師姓名" maxlength="60"></div>
+              <div class="fg"><label for="f-duration">會面時間（約歷時／分鐘）</label><input class="input" type="number" min="0" max="600" id="f-duration" value="15"></div>
+              <div class="fg"><label for="f-s6meet">中六面見</label>
+                <input class="input" id="f-s6meet" list="s6meetList" placeholder="例：第一次" maxlength="40">
+                <datalist id="s6meetList"><option value="第一次"><option value="第二次"><option value="第三次"><option value="跟進面見"><option value="DSE 放榜後"></datalist>
+              </div>
+              <div class="fg full"><label for="f-note">備註</label><input class="input" id="f-note" placeholder="如有" maxlength="500"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">👤 學生基本資料
+              <div class="r"><button class="btn sm" id="btnAutofill" title="從已上載的成績表 PDF 還原成績">⟳ 自動填入中五成績</button></div>
+            </div>
+            <div class="card-b">
+              <div style="font-size:14px;color:var(--text3)">最近一次考試成績 — <span id="gradeTermLbl">中五 下學期</span> <span id="gradeSrcNote"></span></div>
+              <div class="gsub">核心科目</div>
+              <div class="grade-grid" id="gridCore"></div>
+              <div class="gsub">選修科目</div>
+              <div class="grade-grid" id="gridElective"></div>
+              <div class="gsub">其他（紀錄表「其他」一行）</div>
+              <div class="grade-grid" id="gridOther"></div>
+              <div class="fg" style="margin-top:8px"><label for="f-otherSubjects">其他科目成績（自由填寫，例：應用學習 達標）</label>
+                <input class="input" id="f-otherSubjects" placeholder="科目 等級；科目 等級" maxlength="200"></div>
+
+              <div class="dse">
+                <div class="top">
+                  <span class="total" id="dseTotal">—</span>
+                  <div>
+                    <div class="lbl">參考最佳五科（未加權，滿分 35）</div>
+                    <span class="req na" id="dseReq">—</span>
+                  </div>
+                </div>
+                <div class="tags" id="dseTags"></div>
+                <div class="note" id="dseNote"></div>
+              </div>
+
+              <div class="grid2" style="margin-top:16px">
+                <div class="fg full"><label for="f-probe">Probe</label><input class="input" id="f-probe" placeholder="例：資料分析、計算與網絡解決方案、資訊與資源管理" maxlength="300"></div>
+                <div class="fg full"><label for="f-holland">HOLLAND CODE（首三項，如有）</label><input class="input" id="f-holland" placeholder="例：R, I, A" maxlength="60"></div>
+                <div class="fg full"><label for="f-career">夢想的職業</label><input class="input" id="f-career" maxlength="300"></div>
+                <div class="fg full"><label for="f-course">夢想升讀的課程</label><input class="input" id="f-course" maxlength="300"></div>
+                <div class="fg full"><label for="f-jupas">Jupas首三</label><input class="input" id="f-jupas" placeholder="例：JS6377、JS6987、JS6999" maxlength="300"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">📝 會見後老師給予的意見 / 引導同學選擇的結果</div>
+            <div class="card-b grid2">
+              <div class="fg full"><label for="f-opSubject">關於學科選擇</label><textarea class="textarea" id="f-opSubject"></textarea></div>
+              <div class="fg full"><label for="f-opCareer">關於職業選擇</label><textarea class="textarea" id="f-opCareer"></textarea></div>
+              <div class="fg full"><label for="f-opAction">關於未來可以考慮的行動</label><textarea class="textarea" id="f-opAction"></textarea></div>
+              <div class="fg full"><label for="f-opOther">其他</label><textarea class="textarea" id="f-opOther"></textarea></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+            <button class="btn" id="btnExport2">🖨 匯出紀錄表</button>
+            <button class="btn primary" id="btnSave2">💾 儲存紀錄</button>
+          </div>
+        </div>
+
+        <!-- 成績資料 -->
+        <div class="view hidden" id="tab-grades">
+          <div class="card"><div class="card-h">📊 中五全年成績概覽（學生現時成績）</div>
+            <div class="card-b"><div class="grade-grid" id="gridFull"></div>
+              <div class="note" id="pdfGradeNote"></div></div></div>
+        </div>
+
+        <!-- 面談記錄 -->
+        <div class="view hidden" id="tab-history">
+          <div class="card"><div class="card-h">🗂 面談紀錄歷史
+            <div class="r">
+              <button class="btn sm" id="btnNew2">＋ 新增面談</button>
+              <button class="btn sm" id="btnStuJson">匯出全部 (JSON)</button>
+            </div></div>
+            <div class="card-b" id="historyList"></div></div>
+        </div>
+
+        <!-- 比較 -->
+        <div class="view hidden" id="tab-compare">
+          <div class="card"><div class="card-h">🔍 多次面談比較 <span class="note" style="margin:0 0 0 6px">（與上一次不同的內容以底色標示）</span></div>
+            <div class="card-b cmp-wrap" id="compareBox"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- JUPAS 參考 -->
+    <section id="pageJupas" class="hidden">
+      <div class="view jp" style="max-width:1000px">
+  <div class="card">
+    <div class="card-h">🎓 JUPAS 參考：2027 年 JUPAS 招生（2026/27 學年中六 · 應考 2027 年 HKDSE）</div>
+    <div class="card-b">
+      <p style="margin-top:0">以下資料只摘錄自 JUPAS 官方網站（jupas.edu.hk），<b>資料擷取日期：2026 年 10 月 21 日（香港時間）</b>。JUPAS 註明各日期屬暫定，或會更改；向學生提供意見前，請以 JUPAS 網站最新公布為準。
+      標示 <span class="flag">⚠ 請核對</span> 的項目未能從官方頁面完全核實，或官方頁面未註明適用年份。</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">📅 重要日期（2027 JUPAS 招生）</div>
+    <div class="card-b" style="overflow-x:auto">
+      <table>
+        <thead><tr><th style="width:40%">項目</th><th>日期／時間（香港時間）</th><th style="width:14%">負責</th></tr></thead>
+        <tbody>
+          <tr><td>遞交主要申請（Main Applications）</td><td>2026年10月7日（上午9時）至 12月2日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>遞交「比賽／活動的其他經驗及成就」（OEA）</td><td>2026年10月7日（上午9時）至 2027年1月20日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>遲交申請（Late Applications）</td><td>2026年12月4日（上午9時）至 2027年1月13日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>學校遞交學校推薦書（SRR）</td><td>2027年1月20日（上午9時）至 3月17日（下午5時）</td><td>學校</td></tr>
+          <tr><td>遞交其他學歷（語言科目）、音樂資歷、中國語文另類資歷（只適用於非華語申請人）</td><td>2026年10月7日（上午9時）至 2027年4月21日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>學校遞交校長推薦（SPN）</td><td>2027年1月20日（上午9時）至 5月10日（下午5時）</td><td>學校</td></tr>
+          <tr><td>更新課程選擇（放榜前）</td><td>2026年12月4日（上午9時）至 2027年5月26日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>遞交學生學習概覽（SLP）</td><td>2026年10月7日（上午9時）至 2027年5月26日（下午5時）</td><td>申請人</td></tr>
+          <tr><td>取消 JUPAS 申請</td><td>2026年10月7日（上午9時）至 2027年7月14日（下午5時）</td><td>申請人</td></tr>
+          <tr><td><b>2027 年 HKDSE 放榜</b></td><td><b>2027年7月14日</b></td><td>考評局</td></tr>
+          <tr><td>放榜後修改課程選擇（最多加入／替換 5 個課程，免費）</td><td>2027年7月14日（下午3時）至 7月16日（下午3時）</td><td>申請人</td></tr>
+          <tr><td><b>正式遴選（Main Round）放榜</b></td><td><b>2027年8月4日（上午9時）</b>；繳交接受學位費用：8月4日（上午10時30分）至 8月5日（下午5時）</td><td>JUPAS</td></tr>
+          <tr><td>考評局公布覆核成績</td><td>2027年8月11日</td><td>考評局</td></tr>
+          <tr><td>申請重新考慮（Reconsideration）</td><td>遞交要求：2027年8月12日（上午9時至下午5時）；公布結果及繳費：8月19日</td><td>申請人</td></tr>
+          <tr><td>補選（Clearing Round）放榜</td><td>2027年8月24日（上午9時）；同日下午5時前繳費</td><td>JUPAS</td></tr>
+          <tr><td>學校職員使用 JUPAS 網上系統開放</td><td>2026年9月23日 <span class="flag">⚠ 請核對</span>（只見於搜尋摘要，原頁面已無法開啟）</td><td>學校</td></tr>
+        </tbody>
+      </table>
+      <p class="src">來源：JUPAS《2027 Admissions Exercise – Application Key Dates and Deadlines》v1.0（2026年9月9日）<br>
+        https://www.jupas.edu.hk/f/page/231/JUPAS%202027%20Admissions%20Exercise%20%E2%80%93%20Application%20Key%20Dates%20and%20Deadlines.pdf（擷取：2026-10-21）</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">💲 費用及課程選擇數目</div>
+    <div class="card-b" style="overflow-x:auto">
+      <table>
+        <tbody>
+          <tr><th style="width:45%">申請費（2026年10月7日至12月2日）</th><td>HK$500</td></tr>
+          <tr><th>遲交申請費（含申請費 HK$500 及附加費 HK$500）</th><td>HK$1,000</td></tr>
+          <tr><th>放榜前更新課程選擇（2026年12月4日至2027年5月26日）</th><td>每次 HK$100（次數不限）</td></tr>
+          <tr><th>一次性重新遞交費</th><td>HK$250</td></tr>
+          <tr><th>接受學位費用</th><td>HK$5,000</td></tr>
+          <tr><th>重新啟動申請費（繳費限期 2027年1月13日）</th><td>HK$350</td></tr>
+          <tr><th>可選課程數目</th><td>最少 1 個、最多 20 個，須按意願排序</td></tr>
+        </tbody>
+      </table>
+      <p class="src">來源：https://www.jupas.edu.hk/en/application-procedures/application-other-submission-deadline/application-period-and-fee/<br>
+        https://www.jupas.edu.hk/en/application-procedures/application-other-submission-deadline/selection-updating-and-modification-of-programme-choices/（擷取：2026-10-21）</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">📘 一般入學要求（學士學位課程）</div>
+    <div class="card-b" style="overflow-x:auto">
+      <p style="margin-top:0">九所 JUPAS 參與院校的官方頁面，<b>核心科目</b>最低要求相同：</p>
+      <table>
+        <thead><tr><th>中國語文</th><th>英國語文</th><th>數學必修部分</th><th>公民與社會發展科</th></tr></thead>
+        <tbody><tr><td>第 3 級</td><td>第 3 級</td><td>第 2 級</td><td>達標（Attained）</td></tr></tbody>
+      </table>
+      <p>選修科目要求<b>因院校而異</b>：</p>
+      <table>
+        <thead><tr><th>院校</th><th>選修科目最低要求（摘錄）</th></tr></thead>
+        <tbody>
+          <tr><td>香港大學 HKU</td><td>任何 1 科（不包括應用學習及其他語言）第 3 級 ＋ 任何 1 科（不包括應用學習）第 3 級；或 任何 1 科第 3 級 ＋ 數學延伸部分單元一或二 第 3 級</td></tr>
+          <tr><td>香港中文大學 CUHK</td><td>任何 2 科 第 3 級</td></tr>
+          <tr><td>香港科技大學 HKUST</td><td>任何 2 科 第 3 級；或 任何 1 科 第 3 級 ＋ M1／M2 第 3 級</td></tr>
+          <tr><td>香港城市大學 CityUHK</td><td>任何 2 科 第 3 級</td></tr>
+          <tr><td>香港理工大學 PolyU</td><td>任何 2 科 第 3 級；或 任何 1 科 第 3 級 ＋ M1／M2 第 3 級</td></tr>
+          <tr><td>香港浸會大學 HKBU</td><td>任何 2 科 第 3 級</td></tr>
+          <tr><td>嶺南大學 LingnanU</td><td>任何 2 科 第 2 級</td></tr>
+          <tr><td>香港教育大學 EdUHK</td><td>任何 2 科 第 2 級（不多於 1 科應用學習，不包括應用學習中文）</td></tr>
+          <tr><td>香港都會大學 HKMU</td><td>任何 2 科 第 2 級</td></tr>
+        </tbody>
+      </table>
+      <p class="flag">⚠ 請核對：上表摘自各院校在 JUPAS 網站的「Programmes Offered」頁面，頁面本身未明確標示適用年份；個別課程另有科目要求，請按課程編號（JSxxxx）再查閱。</p>
+      <ul style="font-size:14px;color:var(--text2)">
+        <li>公民與社會發展科「達標」是入學要求，但<b>不計入</b>收生分數（見理大頁面附註）。</li>
+        <li>2023/24 或之前修讀通識教育科、取得第 2 級或以上者，可視作符合公民與社會發展科要求（各院校附註略有不同）。</li>
+        <li>本系統的「最低要求」檢查只涵蓋核心科目（中 3、英 3、數 2、公民達標）；選修要求請按上表或個別課程核對。</li>
+        <li>系統「參考最佳五科」詳見下方專節；以 5**=7 … 1=1 未加權相加，<b>未計</b>科目比重；⚠ 部分院校用 8.5 尺。</li>
+      </ul>
+      <p class="src">來源（擷取：2026-10-21）：<br>
+        https://www.jupas.edu.hk/en/programmes-offered/hku/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/cuhk/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/hkust/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/cityuhk/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/polyu/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/hkbu/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/lingnanu/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/eduhk/<br>
+        https://www.jupas.edu.hk/en/programmes-offered/hkmu/</p>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-h">參考「最佳五科」計分（本系統採用）</div>
+      <div class="card-b" style="font-size:14px;color:var(--text2);line-height:1.65">
+        <p><b>本系統算法（面談參考，未加權）</b></p>
+        <ul>
+          <li>等級換算：<b>5**=7、5*=6、5=5、4=4、3=3、2=2、1=1</b>（滿分 5×7=35）。與教大等院校公開說明的甲類科目換算一致。</li>
+          <li>在中文、英文、數學（必修）及甲類選修（含 M2；本校不設 M1／ICT）之中，取<strong>分數最高的 5 科</strong>相加。</li>
+          <li><b>不計入</b>：公民與社會發展（只作「達標」入學門檻）、校本音樂／體育。</li>
+          <li>核心最低要求 <b>332A</b>（中3、英3、數2、公民達標）與最佳五科<strong>分開</strong>檢查；另需兩科選修達各院校門檻（見上表）。</li>
+        </ul>
+        <p><b>例</b>：中4、英3、數5、公民4、物理5*、化學4、M2 5、音樂5** → 計入物理6＋數學5＋M2 5＋中文4＋化學4＝<b>24</b>／35；公民、音樂不計；英3未入選五科。</p>
+        <p class="flag">⚠ 請核對：理大、科大、中大等不少 2026／2027 課程改用 <b>5**=8.5、5*=7、5=5.5</b> 換算，並加科目比重或第 6 科加分，收生分會高於本系統的 35 分制。個別課程公式各異，請用院校 JUPAS 分數計算器核對。</p>
+        <p class="src">來源（擷取：2026-10-21）：<br>
+          PolyU — CSD／通識不計入收生分；Any Best 5：https://www.polyu.edu.hk/study/ug/admissions/jupas/jupas-frequently-asked-questions-admission-score-calculation<br>
+          EdUHK — Best five excluding CSD；5**=7…1=1：https://www.apply.eduhk.hk/ug/jupas_scores<br>
+          LingnanU 2027 — 332A；LS／CSD 不計收生分：https://www.ln.edu.hk/admissions/ug/f/upload/629/3362/Admission%20Requirements_JUPAS%20(UG%20Website)%2026-27.pdf<br>
+          HKUST — 「Attained」不計入、只需 5 科分數：https://www.join.hkust.edu.hk/admissions/jupas<br>
+          CUHK — CS Attained 不計收生分；部分課程用 8.5 尺：https://admission.cuhk.edu.hk/application/jupas/programme-specific-requirements-and-score-calculator/</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">🔗 官方連結</div>
+    <div class="card-b">
+      <ul style="margin:0;line-height:2">
+        <li><a href="https://www.jupas.edu.hk/" target="_blank" rel="noopener noreferrer">JUPAS 官方網站</a></li>
+        <li><a href="https://www.jupas.edu.hk/en/eligibility" target="_blank" rel="noopener noreferrer">申請資格（2027 年有居港過渡安排）</a></li>
+        <li><a href="https://www.jupas.edu.hk/en/application-procedures/application-other-submission-deadline/application-period-and-fee/" target="_blank" rel="noopener noreferrer">申請期及費用</a></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+    </section>
+  </main>
+</div>
+
+<!-- ─── Modals ─── -->
+<div class="ov hidden" id="importModal"><div class="modal">
+  <h2>批量輸入學生名單</h2>
+  <p>學年：<b id="importYear"></b>。每行一位學生，格式：<code>班別　學號　中文姓名　英文姓名　註冊編號　STRN</code>（英文姓名、註冊編號、STRN 均可省略；可直接由 eClass／Excel 複製欄位貼上）</p>
+  <p style="font-size:13px;color:var(--text3)">欄位以空格、Tab 或逗號分隔均可（可直接由 Excel / Google 試算表複製貼上）。英文姓名可省略。同一學年內「班別＋學號」已存在的學生會略過。</p>
+  <div class="pre">6A  1  陳智穎  CHAN CHI WING
+6A  2  陳衍安  CHAN HIN ON
+6B  1  張浩進</div>
+  <textarea class="textarea" id="importText" style="margin-top:10px;min-height:160px" placeholder="在此貼上名單…"></textarea>
+  <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="btnImport">匯入學生</button></div>
+</div></div>
+
+<div class="ov hidden" id="pdfModal"><div class="modal wide">
+  <h2>📄 上載學生成績表 PDF</h2>
+  <p>支援 eClass「學生表現綜合評鑑表」PDF（多頁，每頁一位學生）。以 <b>註冊編號 → STRN → 中文姓名</b> 配對<b>目前學年</b>名單（中五班別／班號只作參考）；姓名不符、同名或名單外會提示，須人手確認。只讀左方成績表，子卷、操行、出席及評語均略過。</p>
+  <div class="field" style="margin:0 0 10px"><label for="pdfTerm">成績欄（填入面談表「中五下學期」）</label>
+    <select id="pdfTerm" class="select"><option value="second">下學期 Second Term（預設）</option><option value="year">全學年 Academic Year</option></select></div>
+  <div id="pdfUpload">
+    <div class="dropzone" id="dropzone">
+      <div style="font-size:32px">📄</div>
+      <div>點擊選擇或拖放 PDF 成績表</div>
+      <div class="note">PDF 只在你的瀏覽器內解析，不會上載原檔。</div>
+    </div>
+    <input type="file" id="pdfInput" accept=".pdf,application/pdf" class="hidden">
+  </div>
+  <div id="pdfProgress" class="hidden" style="margin-top:12px">
+    <div id="pdfProgressText">正在解析…</div>
+    <div class="progress"><div class="track"><div class="fill" id="pdfProgressBar" style="width:0"></div></div></div>
+  </div>
+  <div id="pdfResult" class="hidden" style="margin-top:12px">
+    <div id="pdfSummary"></div>
+    <div style="max-height:46vh;overflow:auto;margin-top:8px"><table class="tbl" id="pdfTable"></table></div>
+  </div>
+  <div class="acts">
+    <button class="btn" id="pdfReset">重新選擇</button>
+    <button class="btn" data-close>關閉</button>
+    <button class="btn primary hidden" id="pdfConfirm">✓ 確認匯入成績</button>
+  </div>
+</div></div>
+
+<div class="ov hidden" id="exportModal"><div class="modal wide">
+  <h2>🖨 匯出個人輔導紀錄表</h2>
+  <div class="fg"><label for="exportRec">選擇紀錄</label><select class="select" id="exportRec"></select></div>
+  <div class="export-opts" style="margin-top:12px">
+    <button class="btn primary" id="expPrint">🖨 列印 / 另存 PDF（A4）</button>
+    <button class="btn" id="expDocx">📄 下載 Word (.docx)</button>
+    <button class="btn" id="expDoc">📄 下載 Word 相容 (.doc)</button>
+    <button class="btn" id="expWin">↗ 在新視窗開啟列印版</button>
+  </div>
+  <div class="preview-box"><div id="exportPreview"></div></div>
+  <div class="acts"><button class="btn" data-close>關閉</button></div>
+</div></div>
+
+<div class="ov hidden" id="classExportModal"><div class="modal">
+  <h2>📁 全班匯出</h2>
+  <div class="grid2">
+    <div class="fg"><label for="ceClass">班別</label><select class="select" id="ceClass"></select></div>
+    <div class="fg"><label for="ceWhich">紀錄</label>
+      <select class="select" id="ceWhich"><option value="latest">每位學生最新一次</option><option value="all">每位學生全部紀錄</option></select></div>
+  </div>
+  <p class="note" id="ceInfo"></p>
+  <div class="export-opts" style="margin-top:10px">
+    <button class="btn primary" id="cePrint">🖨 列印 / 另存 PDF</button>
+    <button class="btn" id="ceDocx">📄 下載 Word (.docx)</button>
+    <button class="btn" id="ceDoc">📄 下載 Word 相容 (.doc)</button>
+    <button class="btn" id="ceCsv">📊 下載面談一覽 (CSV)</button>
+  </div>
+  <div class="acts"><button class="btn" data-close>關閉</button></div>
+</div></div>
+
+<div class="ov hidden" id="backupModal"><div class="modal">
+  <h2>💾 備份與還原</h2>
+  <p>資料已即時儲存於學校 Google 試算表。備份檔可作額外保存或搬遷之用。</p>
+  <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+    <button class="btn primary" id="btnBackup">💾 匯出完整備份（JSON）</button>
+    <button class="btn" id="btnRestore">📂 從備份還原 / 匯入 V5 備份</button>
+    <input type="file" id="restoreInput" accept=".json,application/json" class="hidden">
+  </div>
+  <p class="note">還原支援 V6 備份及 V5（瀏覽器版）的「輔導系統備份_YYYY-MM-DD.json」。V5 的紀錄以中文姓名配對，匯入時會按 學年＋中文姓名 對應名單，同名學生會列出警告。</p>
+  <div id="restorePreview" class="hidden" style="margin-top:10px">
+    <div id="restoreInfo" style="font-size:14px"></div>
+    <div class="fg" style="margin-top:8px"><label for="restoreMode">還原方式</label>
+      <select class="select" id="restoreMode">
+        <option value="merge">合併（建議）：同一學生資料更新，已存在的紀錄不重複</option>
+        <option value="replace">覆蓋：先清空備份內所涉學年的資料再匯入</option>
+      </select></div>
+    <div class="acts"><button class="btn primary" id="btnDoRestore">確認還原</button></div>
+  </div>
+  <div class="acts"><button class="btn" data-close>關閉</button></div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+<div class="loading hidden" id="loading"><div class="spinner"></div></div>
+<div id="printArea"></div>
+
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════
+   漢華升就輔中六個人輔導系統 V6 — 前端
+   ═══════════════════════════════════════════════════════════ */
+
+const TZ = 'Asia/Hong_Kong';
+const PDFJS_VER = '6.4.299';
+const PDFJS_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + PDFJS_VER + '/';
+
+const SUBJ = {
+  chi:{l:'中文',en:'Chinese'}, eng:{l:'英文',en:'English'}, math:{l:'數學',en:'Maths'}, csd:{l:'公民',en:'CSD'},
+  phy:{l:'物理',en:'Physics'}, chem:{l:'化學',en:'Chemistry'}, bio:{l:'生物',en:'Biology'}, m2:{l:'M2',en:'M2'},
+  geo:{l:'地理',en:'Geography'}, hist:{l:'歷史',en:'History'}, chi_hist:{l:'中史',en:'Chin. Hist.'},
+  econ:{l:'經濟',en:'Economics'}, bafs:{l:'企財',en:'BAFS'}, th:{l:'旅款',en:'THS'}, va:{l:'視藝',en:'Visual Arts'},
+  music:{l:'音樂',en:'Music'}, pe:{l:'體育',en:'PE'}
+};
+const CORE = ['chi','eng','math','csd'];
+const ELECT = ['phy','chem','bio','m2','geo','hist','chi_hist','econ','bafs','th','va'];
+const OTHER = ['music','pe']; // 成績表常有的校本音樂／體育；非本校 DSE 選修 → 不計最佳五科
+/**
+ * 參考「最佳五科」（JUPAS 常用簡算法，未加權）
+ * - 換算：5**=7, 5*=6, 5=5, 4=4, 3=3, 2=2, 1=1（EdUHK 等仍用此尺；理大／科大／中大不少課程改用 5**=8.5 尺，見 JUPAS 參考）
+ * - 池：甲類核心中／英／數 + 甲類選修（含 M2）；取最高 5 科分數相加（滿分 35）
+ * - 不計：公民與社會發展（只作達標門檻）、音樂、體育（校本；本校不設 M1／ICT）
+ * - 「332A」核心最低要求與最佳五科分開判斷
+ */
+const BEST5_KEYS = ['chi','eng','math'].concat(ELECT); // 明確不含 csd / music / pe
+const GRADES = ['', 'U', '1', '2', '3', '4', '5', '5*', '5**'];
+const CSD_GRADES = ['', 'U', '1', '2', '3', '4', '5', '5*', '5**', '達標', '不達標'];
+const SCORE = { U:0, '1':1, '2':2, '3':3, '4':4, '5':5, '5*':6, '5**':7 };
+const BEST5_MAX = 35;
+const FIELDS = ['date','teacher','duration','s6meet','note','probe','holland','career','course','jupas','opSubject','opCareer','opAction','opOther','otherSubjects'];
+const FIELD_LABEL = { date:'會面日期', teacher:'負責老師', duration:'會面時間（分鐘）', s6meet:'中六面見', note:'備註', probe:'Probe',
+  holland:'HOLLAND CODE', career:'夢想的職業', course:'夢想升讀的課程', jupas:'Jupas首三', opSubject:'關於學科選擇',
+  opCareer:'關於職業選擇', opAction:'關於未來可以考慮的行動', opOther:'其他', otherSubjects:'其他科目成績' };
+
+/* ── 狀態 ── */
+const S = {
+  email:'', years:[], students:[], records:[], classDefaults:[],
+  year:'', classFilter:'ALL', search:'',
+  curKey:null, curRecId:null, formGrades:{}, tab:'counselling', page:'students',
+  dirty:false, pdfParsed:[], restorePayload:null
+};
+
+/* ═════════ 工具 ═════════ */
+const $ = id => document.getElementById(id);
+function esc(v){ return String(v == null ? '' : v).replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c])); }
+function escBr(v){ return esc(v).replace(/\r?\n/g,'<br>'); }
+function todayHK(){ return new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()); }
+function hkFromMs(ms){
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(new Date(ms)).map(x=>[x.type,x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour === '24' ? '00' : p.hour}:${p.minute}:${p.second}`;
+}
+function yearDisp(y){ return String(y || '').replace('-', '/'); }
+function defaultYear(){ const d = todayHK(); const y = +d.slice(0,4), m = +d.slice(5,7); const s = m >= 8 ? y : y - 1; return s + '-' + String(s + 1).slice(-2); }
+function normCls(c){ return String(c || '').trim().toUpperCase().replace(/^S(?=\d)/,''); }
+function normNo(n){ return String(n == null ? '' : n).trim().replace(/^0+(?=\d)/,''); }
+function skey(o){ return [o.year, normCls(o.cls), normNo(o.no)].join('|'); }
+function clsLetter(c){ return normCls(c).replace(/^\d+/,''); }
+function gradeClass(g){
+  return ({'5**':'c-5ss','5*':'c-5s','5':'c-5','4':'c-4','3':'c-3','2':'c-2','1':'c-1','U':'c-U','達標':'c-ok','不達標':'c-no'})[g] || 'c-empty';
+}
+/** 公民：漢華 eClass 以等級（1–5**）記錄；仍接受 達標／不達標 作後備 */
+function csdNorm(v){
+  v = String(v || '').trim();
+  if (!v) return '';
+  if (v in SCORE) return v;
+  if (/^(達標|A|Attained)$/i.test(v)) return '達標';
+  if (/^(不達標|未達標|Not Attained|F)$/i.test(v)) return '不達標';
+  return v;
+}
+/** 公民是否達標：等級 ≥2 或「達標」 */
+function csdPass(v){ v = csdNorm(v); if (v in SCORE) return SCORE[v] >= 2; return v === '達標'; }
+function toast(msg, type){
+  const t = $('toast'); t.textContent = msg; t.className = 'toast show ' + (type || '');
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), 3500);
+}
+function loading(on){ $('loading').classList.toggle('hidden', !on); }
+function setSaving(txt){ $('savingInd').textContent = txt || ''; }
+function openModal(id){ $(id).classList.remove('hidden'); }
+function closeModal(id){ $(id).classList.add('hidden'); }
+function download(name, blob){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+function safeFile(s){ return String(s).replace(/[\\/:*?"<>|\s]+/g,'_'); }
+
+/** google.script.run → Promise */
+function api(fn, ...args){
+  return new Promise((resolve, reject) => {
+    if (!(window.google && google.script && google.script.run)) { reject(new Error('未連接伺服器（google.script.run 不存在）')); return; }
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(e => reject(e instanceof Error ? e : new Error(e && e.message || String(e))))[fn](...args);
+  });
+}
+async function call(fn, args, busyText){
+  setSaving(busyText || '儲存中…');
+  try { const r = await api(fn, ...(args || [])); setSaving('✓ 已同步'); setTimeout(() => setSaving(''), 2000); return r; }
+  catch (e) { setSaving('⚠ 未能儲存'); toast('伺服器錯誤：' + e.message, 'error'); throw e; }
+}
+
+/* ═════════ 資料存取 ═════════ */
+const yearStudents = () => S.students.filter(s => s.year === S.year);
+const cur = () => S.curKey ? S.students.find(s => skey(s) === S.curKey) || null : null;
+function recsOf(stu){
+  const k = skey(stu);
+  return S.records.filter(r => skey(r) === k).sort((a,b) => (a.date||'').localeCompare(b.date||'') || (a.createdAt||'').localeCompare(b.createdAt||''));
+}
+function hasRec(stu){ const k = skey(stu); return S.records.some(r => skey(r) === k); }
+function classesOf(list){
+  return [...new Set(list.map(s => normCls(s.cls)))].sort((a,b) => a.localeCompare(b, 'en', {numeric:true}));
+}
+function normalizeData(){
+  S.students.forEach(s => { s.cls = normCls(s.cls); s.no = normNo(s.no); s.grades = s.grades || {}; s.pdfGrades = s.pdfGrades || {}; });
+  S.records.forEach(r => { r.cls = normCls(r.cls); r.no = normNo(r.no); r.grades = r.grades || {}; });
+}
+
+/* ═════════ 初始化 ═════════ */
+async function init(){
+  bindUI();
+  applyThemeIcon();
+  loading(true);
+  try {
+    const d = await api('apiBootstrap');
+    S.email = d.email; S.years = d.years; S.students = d.students || []; S.records = d.records || []; S.classDefaults = d.classDefaults || [];
+    normalizeData();
+    let pref = ''; try { pref = localStorage.getItem('hw6_year') || ''; } catch (e) {}
+    S.year = S.years.includes(pref) ? pref : (S.years.includes(defaultYear()) ? defaultYear() : S.years[S.years.length - 1]);
+    $('userEmail').textContent = S.email;
+  } catch (e) {
+    $('emptyState').innerHTML = `<div class="ic">⚠️</div><h2>未能載入資料</h2><p>${esc(e.message)}</p><p class="note">如顯示「未獲授權」，請聯絡系統管理員把你的學校電郵加入「授權老師」分頁。</p>`;
+    loading(false); return;
+  }
+  loading(false);
+  renderAll();
+}
+
+function renderAll(){
+  renderYears(); renderChips(); renderList(); renderProgress(); renderClassTeacherHint();
+  $('importYear').textContent = yearDisp(S.year);
+  if (cur()) renderStudent(); else showEmpty();
+}
+function classDefaultTeacher(cls){
+  cls = normCls(cls || '');
+  const d = (S.classDefaults || []).find(x => x.year === S.year && normCls(x.cls) === cls);
+  return d && d.teacher ? d.teacher : '';
+}
+/** 目前應顯示的班別（篩選中的班，或正在查看的學生所屬班） */
+function hintClass(){
+  if (S.classFilter && S.classFilter !== 'ALL') return S.classFilter;
+  const s = cur(); return s ? s.cls : '';
+}
+function renderClassTeacherHint(){
+  const el = $('classTeacherHint'); if (!el) return;
+  const c = hintClass();
+  if (!c) { el.innerHTML = '<span class="note">選擇班別或學生後，可在此設定／查看該班預設負責老師。</span>'; return; }
+  const t = classDefaultTeacher(c);
+  el.innerHTML = `<b>${esc(c)}</b> 負責老師：${t ? `<b>${esc(t)}</b>` : '<span class="note">（尚未設定）</span>'} <button class="btn sm" type="button" id="btnOpenClassTeacher" style="margin-left:6px">設定</button>`;
+  const b = $('btnOpenClassTeacher'); if (b) b.addEventListener('click', () => openClassTeacherModal(c));
+}
+function openClassTeacherModal(prefCls){
+  const clsList = [...new Set(yearStudents().map(s => s.cls))].sort();
+  if (prefCls && !clsList.includes(prefCls)) clsList.push(prefCls);
+  if (!clsList.length) { toast('請先輸入學生名單', 'error'); return; }
+  $('ctClass').innerHTML = clsList.map(c => `<option value="${esc(c)}"${c === (prefCls || hintClass()) ? ' selected' : ''}>${esc(c)}</option>`).join('');
+  $('ctYear').textContent = yearDisp(S.year);
+  syncCtTeacher();
+  openModal('classTeacherModal');
+}
+function syncCtTeacher(){ $('ctTeacher').value = classDefaultTeacher($('ctClass').value); }
+async function saveClassTeacher(){
+  const cls = $('ctClass').value, teacher = $('ctTeacher').value.trim();
+  loading(true);
+  try {
+    S.classDefaults = await call('apiSaveClassDefault', [S.year, cls, teacher], '儲存…');
+  } catch (e) { loading(false); return; }
+  loading(false);
+  renderClassTeacherHint();
+  // 若目前新增模式且負責老師空白，即時填入
+  if (!S.curRecId && cur() && cur().cls === cls && !$('f-teacher').value && teacher) $('f-teacher').value = teacher;
+  toast(teacher ? `已設定 ${cls} 預設負責老師：${teacher}` : `已清除 ${cls} 預設負責老師`, 'success');
+}
+async function applyClassTeacher(){
+  const cls = $('ctClass').value, teacher = $('ctTeacher').value.trim() || classDefaultTeacher(cls);
+  if (!teacher) { toast('請先輸入並儲存預設負責老師', 'error'); return; }
+  if (!$('ctTeacher').value.trim() || $('ctTeacher').value.trim() !== classDefaultTeacher(cls)) {
+    // 先儲存目前輸入
+    await saveClassTeacher();
+  }
+  const empty = S.records.filter(r => r.year === S.year && r.cls === cls && !String(r.teacher || '').trim()).length;
+  if (!empty) { toast(`${cls} 沒有「負責老師」空白的面談紀錄`, 'success'); return; }
+  if (!confirm(`將把「${teacher}」填入 ${cls} 班共 ${empty} 份「負責老師」空白的面談紀錄。已有老師姓名的紀錄不會改動。確定？`)) return;
+  loading(true);
+  let r;
+  try { r = await call('apiApplyClassTeacher', [S.year, cls], '套用中…'); } catch (e) { loading(false); return; }
+  // 重新載入紀錄
+  try { const d = await api('apiBootstrap'); S.records = d.records || []; S.classDefaults = d.classDefaults || []; } catch (e) {}
+  loading(false);
+  if (cur()) { const id = S.curRecId; if (id) loadRecord(id, true); renderModeBar(); renderHistory(); renderCompare(); }
+  renderAll();
+  toast(`✓ 已更新 ${r.updated} 份紀錄的負責老師為「${r.teacher}」`, 'success');
+}
+
+
+function bindUI(){
+  document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click', () => setPage(b.dataset.nav)));
+  $('themeBtn').addEventListener('click', toggleTheme);
+  $('menuBtn').addEventListener('click', () => document.body.classList.toggle('drawer'));
+  $('btnOpenList').addEventListener('click', () => document.body.classList.add('drawer'));
+  $('scrim').addEventListener('click', () => document.body.classList.remove('drawer'));
+  document.querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.open === 'importModal') $('importYear').textContent = yearDisp(S.year);
+    if (b.dataset.open === 'pdfModal') resetPdf();
+    openModal(b.dataset.open);
+  }));
+  document.querySelectorAll('.ov').forEach(ov => {
+    ov.addEventListener('click', e => { if (e.target === ov) ov.classList.add('hidden'); });
+    ov.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => ov.classList.add('hidden')));
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('.ov:not(.hidden)').forEach(o => o.classList.add('hidden')); });
+  $('yearSelect').addEventListener('change', e => switchYear(e.target.value));
+  $('btnAddYear').addEventListener('click', addYear);
+  $('btnDelYear').addEventListener('click', deleteYear);
+  $('searchInput').addEventListener('input', e => { S.search = e.target.value.trim().toLowerCase(); renderList(); });
+  $('classChips').addEventListener('click', onChipClick);
+  $('studentList').addEventListener('click', onListClick);
+  $('studentList').addEventListener('keydown', e => { if (e.key === 'Enter') onListClick(e); });
+  $('btnClassExport').addEventListener('click', openClassExport);
+  $('tabs').addEventListener('click', e => { const t = e.target.closest('[data-tab]'); if (t) switchTab(t.dataset.tab); });
+  ['btnSave','btnSave2'].forEach(id => $(id).addEventListener('click', saveRecord));
+  ['btnNew','btnNew2'].forEach(id => $(id).addEventListener('click', () => { newInterview(); switchTab('counselling'); }));
+  ['btnExport','btnExport2'].forEach(id => $(id).addEventListener('click', () => openExport()));
+  $('btnAutofill').addEventListener('click', autoFill);
+  $('btnStuJson').addEventListener('click', exportStudentJson);
+  $('historyList').addEventListener('click', onHistoryClick);
+  ['gridCore','gridElective','gridOther'].forEach(id => $(id).addEventListener('change', onGradeChange));
+  FIELDS.forEach(f => { const el = $('f-' + f); if (el) el.addEventListener('input', () => { S.dirty = true; }); });
+  $('btnImport').addEventListener('click', importRoster);
+  $('dropzone').addEventListener('click', () => $('pdfInput').click());
+  $('dropzone').addEventListener('dragover', e => { e.preventDefault(); $('dropzone').classList.add('over'); });
+  $('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('over'));
+  $('dropzone').addEventListener('drop', e => { e.preventDefault(); $('dropzone').classList.remove('over'); const f = e.dataTransfer.files[0]; if (f) handlePdf(f); });
+  $('pdfInput').addEventListener('change', e => { if (e.target.files[0]) handlePdf(e.target.files[0]); });
+  $('pdfReset').addEventListener('click', resetPdf);
+  $('pdfConfirm').addEventListener('click', confirmPdf);
+  const btnCt = $('btnClassTeacher'); if (btnCt) btnCt.addEventListener('click', () => openClassTeacherModal(hintClass()));
+  $('ctClass').addEventListener('change', syncCtTeacher);
+  $('btnSaveClassTeacher').addEventListener('click', saveClassTeacher);
+  $('btnApplyClassTeacher').addEventListener('click', applyClassTeacher);
+  $('btnClearClassTeacher').addEventListener('click', () => { $('ctTeacher').value = ''; saveClassTeacher(); });
+  $('pdfTerm').value = pdfTerm();
+  $('pdfTerm').addEventListener('change', e => { setPdfTerm(e.target.value); if (S.pdfPages) { S.pdfParsed = matchParsed(parseEclassPages(S.pdfPages, e.target.value)); showPdfResult(); } });
+  $('exportRec').addEventListener('change', renderExportPreview);
+  $('expPrint').addEventListener('click', () => { const x = exportSel(); if (x) printForms([x]); });
+  $('expDocx').addEventListener('click', () => { const x = exportSel(); if (x) downloadDocx([x], fileBase(x)); });
+  $('expDoc').addEventListener('click', () => { const x = exportSel(); if (x) downloadDoc([x], fileBase(x)); });
+  $('expWin').addEventListener('click', () => { const x = exportSel(); if (x) openPrintWindow([x]); });
+  $('ceClass').addEventListener('change', updateClassExportInfo);
+  $('ceWhich').addEventListener('change', updateClassExportInfo);
+  $('cePrint').addEventListener('click', () => { const l = classExportList(); if (l.length) printForms(l); });
+  $('ceDocx').addEventListener('click', () => { const l = classExportList(); if (l.length) downloadDocx(l, classFileBase()); });
+  $('ceDoc').addEventListener('click', () => { const l = classExportList(); if (l.length) downloadDoc(l, classFileBase()); });
+  $('ceCsv').addEventListener('click', classCsv);
+  $('btnBackup').addEventListener('click', exportBackup);
+  $('btnRestore').addEventListener('click', () => $('restoreInput').click());
+  $('restoreInput').addEventListener('change', e => { if (e.target.files[0]) readRestoreFile(e.target.files[0]); e.target.value = ''; });
+  $('btnDoRestore').addEventListener('click', doRestore);
+  window.addEventListener('beforeunload', e => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
+  window.addEventListener('afterprint', () => document.body.classList.remove('printing'));
+}
+
+/* ═════════ 深淺模式、頁面 ═════════ */
+function toggleTheme(){
+  const dark = document.documentElement.classList.toggle('dark');
+  try { localStorage.setItem('hw6_theme', dark ? 'dark' : 'light'); } catch (e) {}
+  applyThemeIcon();
+}
+function applyThemeIcon(){ $('themeBtn').textContent = document.documentElement.classList.contains('dark') ? '☀️' : '🌙'; }
+function setPage(p){
+  S.page = p;
+  $('pageStudents').classList.toggle('hidden', p !== 'students');
+  $('pageJupas').classList.toggle('hidden', p !== 'jupas');
+  $('navStudents').classList.toggle('active', p === 'students');
+  $('navJupas').classList.toggle('active', p === 'jupas');
+  document.body.classList.remove('drawer');
+  $('main').scrollTop = 0;
+}
+
+/* ═════════ 學年 ═════════ */
+function renderYears(){
+  $('yearSelect').innerHTML = S.years.map(y => `<option value="${esc(y)}"${y === S.year ? ' selected' : ''}>${esc(yearDisp(y))}</option>`).join('');
+}
+function switchYear(y){
+  if (y === S.year) return;
+  if (S.dirty && !confirm('目前表格有未儲存的修改，確定切換學年？')) { renderYears(); return; }
+  S.year = y; S.curKey = null; S.curRecId = null; S.classFilter = 'ALL'; S.dirty = false;
+  try { localStorage.setItem('hw6_year', y); } catch (e) {}
+  renderAll(); toast('已切換至 ' + yearDisp(y) + ' 學年', 'success');
+}
+async function addYear(){
+  const last = S.years[S.years.length - 1] || defaultYear(); const st = +last.slice(0,4) + 1; const def = st + '-' + String(st + 1).slice(-2);
+  const input = prompt('輸入新學年（格式：YYYY-YY，例如 ' + def + '）：', def);
+  if (!input) return;
+  const y = input.trim().replace('/', '-');
+  if (!/^\d{4}-\d{2}$/.test(y) || (+y.slice(0,4) + 1) % 100 !== +y.slice(5)) { toast('格式不正確，請輸入如 ' + def, 'error'); return; }
+  if (S.years.includes(y)) { toast(yearDisp(y) + ' 學年已存在', 'error'); return; }
+  try { S.years = await call('apiAddYear', [y]); } catch (e) { return; }
+  S.dirty = false; switchYear(y);
+}
+async function deleteYear(){
+  const y = S.year;
+  const ns = yearStudents().length, nr = S.records.filter(r => r.year === y).length;
+  if (!confirm(`確定刪除「${yearDisp(y)}」學年的所有資料？\n學生 ${ns} 位、面談紀錄 ${nr} 份\n此操作不可還原（建議先匯出備份）。`)) return;
+  if (prompt(`請輸入學年「${yearDisp(y)}」以確認刪除：`) !== yearDisp(y)) { toast('已取消'); return; }
+  loading(true);
+  try { await call('apiDeleteYear', [y]); } catch (e) { loading(false); return; }
+  loading(false);
+  S.students = S.students.filter(s => s.year !== y); S.records = S.records.filter(r => r.year !== y);
+  S.years = S.years.filter(x => x !== y); if (!S.years.length) S.years = [defaultYear()];
+  S.year = ''; S.dirty = false; switchYear(S.years[S.years.length - 1]);
+}
+
+/* ═════════ 班別、名單 ═════════ */
+function renderChips(){
+  const cls = classesOf(yearStudents());
+  if (S.classFilter !== 'ALL' && !cls.includes(S.classFilter)) S.classFilter = 'ALL';
+  // 「全部」永遠排第一
+  $('classChips').innerHTML = `<span class="chip all${S.classFilter === 'ALL' ? ' active' : ''}"><button data-cls="ALL">全部</button></span>` +
+    cls.map(c => `<span class="chip${S.classFilter === c ? ' active' : ''}"><button data-cls="${esc(c)}">${esc(c)}</button><button class="x" data-delcls="${esc(c)}" title="刪除 ${esc(c)} 班">×</button></span>`).join('');
+}
+function onChipClick(e){
+  const del = e.target.closest('[data-delcls]');
+  if (del) { deleteClass(del.dataset.delcls); return; }
+  const b = e.target.closest('[data-cls]');
+  if (b) { S.classFilter = b.dataset.cls; renderChips(); renderList(); renderClassTeacherHint(); }
+}
+function renderList(){
+  const q = S.search;
+  const list = yearStudents().filter(s => (S.classFilter === 'ALL' || s.cls === S.classFilter) &&
+      (!q || s.chi.toLowerCase().includes(q) || (s.eng || '').toLowerCase().includes(q) || (s.cls + s.no).toLowerCase().includes(q) || (s.cls + '-' + s.no).toLowerCase().includes(q)))
+    .sort(sortStu);
+  const el = $('studentList');
+  if (!list.length) { el.innerHTML = `<div class="note" style="padding:16px">${yearStudents().length ? '無符合學生' : '此學年未有學生，請先批量輸入名單'}</div>`; return; }
+  el.innerHTML = list.map(s => {
+    const k = skey(s), n = recsOf(s).length;
+    return `<div class="si${k === S.curKey ? ' active' : ''}" data-key="${esc(k)}" role="button" tabindex="0">
+      <span class="dot${n ? ' done' : ''}" title="${n ? '已面談' : '未面談'}"></span>
+      <div style="min-width:0"><div class="nm">${esc(s.chi)}</div><div class="en">${esc(s.eng || '')}</div></div>
+      <div class="meta">${esc(s.cls)}-${esc(s.no)}${n ? `<div class="cnt">${n} 次</div>` : ''}</div>
+      <button class="del" data-delkey="${esc(k)}" title="刪除學生" aria-label="刪除學生">×</button></div>`;
+  }).join('');
+}
+function sortStu(a, b){ return a.cls.localeCompare(b.cls,'en',{numeric:true}) || a.no.localeCompare(b.no,'en',{numeric:true}); }
+function onListClick(e){
+  const d = e.target.closest('[data-delkey]');
+  if (d) { e.stopPropagation(); deleteStudent(d.dataset.delkey); return; }
+  const it = e.target.closest('[data-key]');
+  if (it) selectStudent(it.dataset.key);
+}
+function renderProgress(){
+  const list = yearStudents();
+  $('progressWrap').classList.toggle('hidden', !list.length);
+  if (!list.length) return;
+  const done = list.filter(hasRec).length;
+  $('progressText').textContent = `${done} / ${list.length}`;
+  $('progressFill').style.width = Math.round(done / list.length * 100) + '%';
+  $('progressClasses').innerHTML = classesOf(list).map(c => {
+    const cs = list.filter(s => s.cls === c);
+    return `<b>${esc(c)}</b> ${cs.filter(hasRec).length}/${cs.length}`;
+  }).join(' · ');
+}
+async function deleteClass(c){
+  const stus = yearStudents().filter(s => s.cls === c);
+  const keys = new Set(stus.map(skey));
+  const nr = S.records.filter(r => keys.has(skey(r))).length;
+  if (!confirm(`確定刪除 ${yearDisp(S.year)} 學年「${c}」班？\n將一併刪除：學生 ${stus.length} 位、面談紀錄 ${nr} 份。\n此操作不可還原。`)) return;
+  loading(true);
+  try { await call('apiDeleteClass', [S.year, c]); } catch (e) { loading(false); return; }
+  loading(false);
+  S.students = S.students.filter(s => !keys.has(skey(s)));
+  S.records = S.records.filter(r => !keys.has(skey(r)));
+  if (S.curKey && keys.has(S.curKey)) { S.curKey = null; S.dirty = false; }
+  if (S.classFilter === c) S.classFilter = 'ALL';
+  renderAll(); toast(`已刪除 ${c} 班：學生 ${stus.length} 位、紀錄 ${nr} 份`, 'success');
+}
+async function deleteStudent(k){
+  const s = S.students.find(x => skey(x) === k); if (!s) return;
+  const nr = recsOf(s).length;
+  if (!confirm(`確定刪除學生「${s.chi}」（${s.cls}-${s.no}）及其 ${nr} 份面談紀錄？\n此操作不可還原。`)) return;
+  try { await call('apiDeleteStudent', [s.year, s.cls, s.no]); } catch (e) { return; }
+  S.students = S.students.filter(x => skey(x) !== k);
+  S.records = S.records.filter(r => skey(r) !== k);
+  if (S.curKey === k) { S.curKey = null; S.dirty = false; }
+  renderAll(); toast(`已刪除學生「${s.chi}」`, 'success');
+}
+
+/* ═════════ 名單匯入 ═════════ */
+function parseRoster(text, year){
+  const out = [], errors = [], seen = new Set(S.students.filter(s => s.year === year).map(skey));
+  let skipped = 0;
+  text.split(/\r?\n/).forEach((line, i) => {
+    if (!line.trim()) return;
+    const parts = line.trim().replace(/[,，、\t]+/g, ' ').split(/\s+/).filter(Boolean);
+    if (parts.length < 3) { errors.push(`第 ${i + 1} 行格式不正確（至少需要：班別 學號 中文姓名）`); return; }
+    const [cls, no, chi] = parts; let rest = parts.slice(3);
+    // 選填：註冊編號（全數字，如 202424001）、STRN（字母＋數字，如 S2922276）；可放在英文名之後，次序不拘
+    let reg = '', strn = '';
+    rest = rest.filter(t => {
+      if (!reg && /^\d{6,12}$/.test(t)) { reg = t; return false; }
+      if (!strn && /^[A-Za-z]\d{6,8}[0-9A-Za-z()]?$/.test(t)) { strn = t.toUpperCase(); return false; }
+      return true;
+    });
+    const eng = rest.join(' ');
+    if (!/^S?\d[A-Za-z]$/i.test(cls)) { errors.push(`第 ${i + 1} 行：「${cls}」不像班別（例：6A）`); return; }
+    if (!/^\d{1,3}$/.test(no)) { errors.push(`第 ${i + 1} 行：學號「${no}」應為數字`); return; }
+    if (!/[\u3400-\u9fff]/.test(chi)) { errors.push(`第 ${i + 1} 行：「${chi}」不像中文姓名，請檢查欄位次序`); return; }
+    const s = { year, cls: normCls(cls), no: normNo(no), chi, eng: eng.toUpperCase(), reg, strn, remarks: '' };
+    if (seen.has(skey(s))) { skipped++; return; }
+    seen.add(skey(s)); out.push(s);
+  });
+  return { out, errors, skipped };
+}
+async function importRoster(){
+  const { out, errors, skipped } = parseRoster($('importText').value, S.year);
+  if (!out.length) {
+    toast(errors.length ? '沒有可匯入的學生' : (skipped ? `全部 ${skipped} 位已存在` : '請先貼上名單'), 'error');
+    if (errors.length) alert('部分行有問題：\n\n' + errors.join('\n'));
+    return;
+  }
+  loading(true);
+  let r;
+  try { r = await call('apiUpsertStudents', [out, { skipExisting: true }]); } catch (e) { loading(false); return; }
+  loading(false);
+  out.forEach(s => { s.grades = {}; s.pdfGrades = {}; S.students.push(s); });
+  closeModal('importModal'); $('importText').value = '';
+  renderAll();
+  toast(`已新增 ${r.added} 位學生` + (skipped + r.skipped ? `，${skipped + r.skipped} 位已存在略過` : ''), 'success');
+  if (errors.length) setTimeout(() => alert('部分行有問題，未有匯入：\n\n' + errors.join('\n')), 300);
+}
+
+/* ═════════ 學生頁 ═════════ */
+function showEmpty(){ $('emptyState').classList.remove('hidden'); $('studentContent').classList.add('hidden'); }
+function selectStudent(k){
+  if (k !== S.curKey && S.dirty && !confirm('目前表格有未儲存的修改，確定離開？')) return;
+  S.curKey = k; S.dirty = false;
+  const s = cur(); if (!s) return;
+  const recs = recsOf(s);
+  if (recs.length) loadRecord(recs[recs.length - 1].id, true); else newInterview(true);
+  document.body.classList.remove('drawer');
+  setPage('students');
+  renderStudent(); renderList();
+}
+function summaryText(g){ return `中 ${g.chi || '—'}　英 ${g.eng || '—'}　數 ${g.math || '—'}　公民 ${g.csd || '—'}`; }
+function renderStudent(){
+  const s = cur(); if (!s) { showEmpty(); return; }
+  $('emptyState').classList.add('hidden'); $('studentContent').classList.remove('hidden');
+  $('hdrName').textContent = s.chi;
+  $('hdrSub').textContent = '個人輔導紀錄表 中六' + yearDisp(s.year) + '　·　' + s.cls + '-' + s.no;
+  $('pfChi').textContent = s.chi; $('pfEng').textContent = s.eng || '';
+  $('pfCls').textContent = s.cls; $('pfNo').textContent = s.no;
+  $('pfIds').textContent = [cur().reg ? '註冊編號 ' + cur().reg : '', cur().strn ? 'STRN ' + cur().strn : ''].filter(Boolean).join('　');
+  $('pfSum').textContent = summaryText(s.grades || {});
+  const n = recsOf(s).length;
+  $('pfBadge').textContent = n ? `已面談 ${n} 次` : '未面談';
+  $('pfBadge').className = 'badge ' + (n ? 'done' : 'pending');
+  renderGradeForm(); renderFullGrades(); recalcDSE(); renderModeBar(); renderHistory(); renderCompare();
+  switchTab(S.tab);
+}
+function switchTab(t){
+  S.tab = t;
+  document.querySelectorAll('#tabs .tab').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
+  ['counselling','grades','history','compare'].forEach(x => $('tab-' + x).classList.toggle('hidden', x !== t));
+}
+
+/* 成績 */
+function gradeSelect(k, v){
+  const opts = (k === 'csd' ? CSD_GRADES : GRADES).map(o => `<option value="${esc(o)}"${o === v ? ' selected' : ''}>${o || '—'}</option>`).join('');
+  return `<div class="gi"><div class="s">${esc(SUBJ[k].l)}</div><select data-g="${k}" class="${gradeClass(v)}" aria-label="${esc(SUBJ[k].l)}成績">${opts}</select></div>`;
+}
+function renderGradeForm(){
+  const g = S.formGrades;
+  $('gridCore').innerHTML = CORE.map(k => gradeSelect(k, g[k] || '')).join('');
+  $('gridElective').innerHTML = ELECT.map(k => gradeSelect(k, g[k] || '')).join('');
+  $('gridOther').innerHTML = OTHER.map(k => gradeSelect(k, g[k] || '')).join('');
+  if ($('gradeTermLbl')) $('gradeTermLbl').textContent = '中五 ' + termOf(cur(), S.formGrades);
+  $('gradeSrcNote').textContent = S.curRecId ? '（顯示此紀錄儲存時的成績快照）' : '';
+}
+function renderFullGrades(){
+  const s = cur(); const g = s.grades || {};
+  const keys = CORE.concat(ELECT, OTHER).filter(k => g[k]);
+  $('gridFull').innerHTML = keys.length ? keys.map(k => `<div class="gi"><div class="s">${esc(SUBJ[k].l)}</div><div class="v ${gradeClass(g[k])}">${esc(g[k])}</div><div class="note" style="margin:0">${esc(SUBJ[k].en)}</div></div>`).join('')
+    : '<div class="note">未有成績。可上載成績表 PDF，或在「個人輔導」頁人手選擇。</div>';
+  const pk = Object.keys(s.pdfGrades || {}).filter(k => s.pdfGrades[k]);
+  $('pdfGradeNote').textContent = pk.length ? '成績表 PDF 原始成績：' + pk.map(k => (SUBJ[k] ? SUBJ[k].l : k) + ' ' + s.pdfGrades[k]).join('、') : '未有上載成績表 PDF 的原始成績。';
+}
+let gradeTimer = null;
+function onGradeChange(e){
+  const sel = e.target.closest('select[data-g]'); if (!sel) return;
+  const k = sel.dataset.g, v = sel.value;
+  if (v) S.formGrades[k] = v; else delete S.formGrades[k];
+  sel.className = gradeClass(v); S.dirty = true;
+  recalcDSE();
+  if (!S.curRecId) persistStudentGrades(S.formGrades); // 新增模式：同時更新學生現時成績（儲存至試算表）
+}
+function persistStudentGrades(grades){
+  const s = cur(); if (!s) return;
+  s.grades = Object.assign({}, grades);
+  renderFullGrades();
+  $('pfSum').textContent = summaryText(s.grades);
+  clearTimeout(gradeTimer);
+  const snap = { year: s.year, cls: s.cls, no: s.no, grades: Object.assign({}, s.grades) };
+  gradeTimer = setTimeout(() => call('apiSaveGrades', [snap.year, snap.cls, snap.no, snap.grades], '儲存成績…').catch(() => {}), 700);
+}
+function autoFill(){
+  const s = cur(); if (!s) return;
+  const pg = s.pdfGrades || {};
+  if (!Object.keys(pg).some(k => pg[k])) { toast('此學生未有成績表 PDF 資料，請先上載成績表', 'error'); return; }
+  S.formGrades = Object.assign({}, pg); S.dirty = true;
+  renderGradeForm(); recalcDSE();
+  if (!S.curRecId) persistStudentGrades(S.formGrades);
+  toast('✓ 已從成績表 PDF 還原中五下學期成績', 'success');
+}
+
+/* DSE：參考最佳五科（未加權）＋獨立的 332A 核心門檻 */
+function calcDSE(g){
+  g = g || {};
+  // 只取 BEST5_KEYS；即使 g 內有公民／音樂／體育分數也不會進入池
+  const scored = BEST5_KEYS.filter(k => g[k] && SCORE[g[k]] !== undefined)
+    .map(k => ({ k, l: SUBJ[k].l, g: g[k], s: SCORE[g[k]] }));
+  // 若同時有 M1、M2（舊資料），只計較高一科（理大附註：兩單元只作一科）
+  let pool = scored;
+  const m1 = scored.find(x => x.k === 'm1'), m2 = scored.find(x => x.k === 'm2');
+  if (m1 && m2) pool = scored.filter(x => x !== (m1.s >= m2.s ? m2 : m1));
+  pool = pool.slice().sort((a, b) => b.s - a.s || a.l.localeCompare(b.l, 'zh-HK'));
+  const best5 = pool.slice(0, 5);
+  const total = best5.reduce((t, x) => t + x.s, 0);
+  const c = SCORE[g.chi], e = SCORE[g.eng], m = SCORE[g.math], csd = csdNorm(g.csd);
+  let req;
+  if ([c, e, m].some(x => x === undefined) || !csd) req = { cls: 'na', text: '核心科目成績未齊，未能判斷 332A' };
+  else {
+    const fail = [];
+    if (c < 3) fail.push(`中文需≥3（現 ${g.chi}）`);
+    if (e < 3) fail.push(`英文需≥3（現 ${g.eng}）`);
+    if (m < 2) fail.push(`數學需≥2（現 ${g.math}）`);
+    if (!csdPass(csd)) fail.push(`公民需達標（等級≥2 或「達標」；現 ${g.csd}）`);
+    req = fail.length
+      ? { cls: 'fail', text: '✗ 未符核心最低要求（332A）：' + fail.join('、') }
+      : { cls: 'pass', text: '✓ 符合核心最低要求 332A（中3、英3、數2、公民達標）；選修門檻見「JUPAS 參考」' };
+  }
+  return { scored, best5, total, req, csd, max: BEST5_MAX };
+}
+function recalcDSE(){
+  const g = S.formGrades, r = calcDSE(g);
+  $('dseTotal').textContent = r.best5.length ? r.total : '—';
+  $('dseReq').className = 'req ' + r.req.cls; $('dseReq').textContent = r.req.text;
+  const used = new Set(r.best5.map(x => x.k));
+  const excluded = [];
+  if (g.csd) excluded.push(`<span class="tagx" title="公民只作 332A 門檻，不計入最佳五科">公民 ${esc(g.csd)}（不計分）</span>`);
+  ['music','pe'].forEach(k => { if (g[k]) excluded.push(`<span class="tagx" title="校本音樂／體育不計入最佳五科">${esc(SUBJ[k].l)} ${esc(g[k])}（不計分）</span>`); });
+  $('dseTags').innerHTML = excluded.join('') +
+    r.scored.slice().sort((a, b) => b.s - a.s).map(x => `<span class="tagx${used.has(x.k) ? ' used' : ''}" title="${used.has(x.k) ? '已計入最佳五科' : '未入選最佳五科'}">${esc(x.l)} ${esc(x.g)}（${x.s}）</span>`).join('');
+  $('dseNote').innerHTML = r.best5.length
+    ? `參考最佳五科（未加權）：${r.best5.map(x => esc(x.l) + ' ' + esc(x.g) + '=' + x.s).join(' + ')} = <b>${r.total}</b> / ${BEST5_MAX}。換算 5**=7…1=1；公民、音樂、體育不計。⚠ 理大／科大／中大等不少課程用 5**=8.5 尺及科目比重，實際收生分請用院校計算器核對（見「JUPAS 參考」）。`
+    : '填入中／英／數或選修成績以計算參考最佳五科。公民達標與最佳五科分開檢查。';
+}
+
+/* 表格 */
+function fillForm(rec){
+  FIELDS.forEach(f => { const el = $('f-' + f); if (el) el.value = rec && rec[f] != null ? rec[f] : ''; });
+  if (!$('f-duration').value) $('f-duration').value = '15';
+  if (!$('f-date').value) $('f-date').value = todayHK();
+}
+function getForm(){ const o = {}; FIELDS.forEach(f => { const el = $('f-' + f); o[f] = el ? el.value.trim() : ''; }); return o; }
+function newInterview(silent){
+  const s = cur(); if (!s) return;
+  if (!silent && S.dirty && !confirm('目前表格有未儲存的修改，確定清空並新增面談？')) return;
+  S.curRecId = null; S.dirty = false;
+  const recs = recsOf(s);
+  fillForm(null);
+  $('f-date').value = todayHK();
+  if (recs.length) $('f-teacher').value = recs[recs.length - 1].teacher || '';
+  if (!$('f-teacher').value) { const def = classDefaultTeacher(s.cls); if (def) $('f-teacher').value = def; }
+  $('f-s6meet').value = ['第一次','第二次','第三次'][recs.length] || '';
+  S.formGrades = Object.assign({}, s.grades || {});
+  if (!silent) { renderGradeForm(); recalcDSE(); renderModeBar(); renderHistory(); toast('已清空表格，可填寫新一次面談', 'success'); }
+}
+function loadRecord(id, silent){
+  const s = cur(); const r = S.records.find(x => x.id === id); if (!s || !r) return;
+  S.curRecId = id; S.dirty = false;
+  fillForm(r);
+  S.formGrades = Object.assign({}, (r.grades && Object.keys(r.grades).length) ? r.grades : s.grades);
+  if (!silent) { renderGradeForm(); recalcDSE(); renderModeBar(); renderHistory(); switchTab('counselling'); toast('已載入第 ' + (recsOf(s).findIndex(x => x.id === id) + 1) + ' 次面談紀錄', 'success'); }
+}
+function renderModeBar(){
+  const s = cur(); const recs = s ? recsOf(s) : [];
+  const idx = recs.findIndex(r => r.id === S.curRecId);
+  if (idx < 0) {
+    $('modeBar').className = 'modebar new'; $('modeText').textContent = '新增面談紀錄（儲存後新增為第 ' + (recs.length + 1) + ' 次）';
+    $('modeCount').textContent = recs.length ? `已有 ${recs.length} 次紀錄` : '';
+  } else {
+    const r = recs[idx];
+    $('modeBar').className = 'modebar edit'; $('modeText').textContent = `編輯第 ${idx + 1} 次面談`;
+    $('modeCount').textContent = `共 ${recs.length} 次 · 建立：${r.createdBy || '—'} ${r.createdAt || ''}` + (r.updatedAt ? ` · 最後修改：${r.updatedBy || ''} ${r.updatedAt}` : '');
+  }
+}
+async function saveRecord(){
+  const s = cur(); if (!s) return;
+  const f = getForm();
+  if (!f.date) { toast('請填寫會面日期', 'error'); $('f-date').focus(); return; }
+  const rec = Object.assign({ id: S.curRecId || '', year: s.year, cls: s.cls, no: s.no, chi: s.chi, grades: Object.assign({}, S.formGrades, { _term: S.formGrades._term || ((s.pdfGrades || {})._term) || 'second' }) }, f);
+  const btns = [$('btnSave'), $('btnSave2')]; btns.forEach(b => b.disabled = true);
+  let saved;
+  try { saved = await call('apiSaveRecord', [rec]); } catch (e) { btns.forEach(b => b.disabled = false); return; }
+  btns.forEach(b => b.disabled = false);
+  saved.cls = normCls(saved.cls); saved.no = normNo(saved.no); saved.grades = saved.grades || {};
+  const i = S.records.findIndex(r => r.id === saved.id);
+  if (i >= 0) S.records[i] = saved; else S.records.push(saved);
+  S.curRecId = saved.id; S.dirty = false;
+  const recs = recsOf(s);
+  renderStudent(); renderList(); renderProgress();
+  toast(`✓ 第 ${recs.findIndex(r => r.id === saved.id) + 1} 次面談紀錄已儲存（共 ${recs.length} 次）`, 'success');
+}
+
+/* 歷史 */
+function recFieldsKV(r){
+  return FIELDS.filter(f => r[f]).map(f => `<div class="k">${esc(FIELD_LABEL[f])}</div><div class="v">${esc(r[f])}${f === 'duration' ? ' 分鐘' : ''}</div>`).join('');
+}
+function renderHistory(){
+  const s = cur(); if (!s) return;
+  const recs = recsOf(s);
+  if (!recs.length) { $('historyList').innerHTML = '<div class="note" style="text-align:center;padding:20px">未有面談紀錄，按「＋ 新增面談」開始記錄</div>'; return; }
+  $('historyList').innerHTML = recs.map((r, i) => ({ r, i })).reverse().map(({ r, i }) => {
+    const g = r.grades || {};
+    const gt = CORE.concat(ELECT, OTHER).filter(k => g[k]).map(k => `${SUBJ[k].l} ${g[k]}`).join('　');
+    const prev = [r.opSubject, r.opCareer, r.opAction].filter(Boolean)[0] || '';
+    return `<div class="hc${r.id === S.curRecId ? ' cur' : ''}" data-id="${esc(r.id)}">
+      <div class="hc-h" data-toggle="1"><div class="hc-n">${i + 1}</div>
+        <div style="flex:1;min-width:0"><div><b>${esc(r.date || '（未填日期）')}</b>　<span class="note">${esc(r.duration || '—')} 分鐘 · ${esc(r.s6meet || '')}</span></div>
+        <div class="note" style="margin:0">${esc(r.teacher || '未填寫老師')}${prev ? ' · ' + esc(prev.slice(0, 60)) : ''}</div></div>
+        ${r.id === S.curRecId ? '<span class="badge done">目前編輯</span>' : ''}<span class="note" style="margin:0">▾</span></div>
+      <div class="hc-b">
+        <div class="kv">${gt ? `<div class="k">成績快照</div><div class="v">${esc(gt)}</div>` : ''}${recFieldsKV(r)}
+          <div class="k">建立 / 修改</div><div class="v">${esc(r.createdBy || '')} ${esc(r.createdAt || '')}${r.updatedAt ? '；' + esc(r.updatedBy || '') + ' ' + esc(r.updatedAt) : ''}</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+          <button class="btn sm" data-act="edit">✏ 編輯此紀錄</button>
+          <button class="btn sm" data-act="export">🖨 匯出紀錄表</button>
+          <button class="btn sm danger" data-act="del">刪除</button>
+        </div></div></div>`;
+  }).join('');
+}
+function onHistoryClick(e){
+  const card = e.target.closest('.hc'); if (!card) return;
+  const id = card.dataset.id;
+  const act = e.target.closest('[data-act]');
+  if (act) {
+    if (act.dataset.act === 'edit') { if (S.dirty && !confirm('目前表格有未儲存的修改，確定載入其他紀錄？')) return; loadRecord(id); }
+    if (act.dataset.act === 'export') openExport(id);
+    if (act.dataset.act === 'del') deleteRecord(id);
+    return;
+  }
+  if (e.target.closest('[data-toggle]')) card.classList.toggle('open');
+}
+async function deleteRecord(id){
+  const s = cur(); const recs = recsOf(s); const i = recs.findIndex(r => r.id === id);
+  if (!confirm(`確定刪除第 ${i + 1} 次面談紀錄（${recs[i].date || ''}）？此操作不可還原。`)) return;
+  try { await call('apiDeleteRecord', [id]); } catch (e) { return; }
+  S.records = S.records.filter(r => r.id !== id);
+  if (S.curRecId === id) newInterview(true);
+  renderStudent(); renderList(); renderProgress(); toast('紀錄已刪除', 'success');
+}
+function exportStudentJson(){
+  const s = cur(); const recs = recsOf(s);
+  if (!recs.length) { toast('此學生未有紀錄', 'error'); return; }
+  download(`輔導紀錄_${safeFile(s.cls + '-' + s.no + '_' + s.chi)}_全部.json`, new Blob([JSON.stringify({ student: s, records: recs }, null, 2)], { type: 'application/json' }));
+}
+
+/* 比較 */
+function renderCompare(){
+  const s = cur(); if (!s) return;
+  const recs = recsOf(s);
+  if (recs.length < 2) { $('compareBox').innerHTML = `<div class="note">需有兩次或以上面談紀錄才可比較（目前 ${recs.length} 次）。</div>`; return; }
+  const rows = [];
+  const gradeKeys = CORE.concat(ELECT, OTHER).filter(k => recs.some(r => r.grades && r.grades[k]));
+  const cell = (vals, i, v) => `<td class="${i > 0 && vals[i] !== vals[i - 1] ? 'chg' : ''}">${esc(v)}</td>`;
+  const tot = recs.map(r => { const d = calcDSE(r.grades); return d.best5.length ? d.total + ' / 35' : '—'; });
+  rows.push(`<tr><td class="k">參考最佳五科（未加權）</td>${tot.map((v, i) => cell(tot, i, v)).join('')}</tr>`);
+  gradeKeys.forEach(k => { const vs = recs.map(r => (r.grades || {})[k] || '—'); rows.push(`<tr><td class="k">${esc(SUBJ[k].l)}</td>${vs.map((v, i) => cell(vs, i, v)).join('')}</tr>`); });
+  FIELDS.filter(f => f !== 'date').forEach(f => {
+    const vs = recs.map(r => r[f] || '');
+    if (!vs.some(Boolean)) return;
+    rows.push(`<tr><td class="k">${esc(FIELD_LABEL[f])}</td>${vs.map((v, i) => cell(vs, i, v || '—')).join('')}</tr>`);
+  });
+  $('compareBox').innerHTML = `<table class="cmp"><thead><tr><th>項目</th>${recs.map((r, i) => `<th>第 ${i + 1} 次<br><span class="note">${esc(r.date || '')} ${esc(r.teacher || '')}</span></th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+/* ═════════ 紀錄表（排版同《面談表格.docx》）═════════ */
+const FORM_GRID = [1203,400,801,800,403,1205,1206,400,803,803,400,1204]; // 原表格 tblGrid（twips）
+function parseOthers(g, txt){
+  const out = OTHER.filter(k => g[k]).map(k => [SUBJ[k].l, g[k]]);
+  String(txt || '').split(/[；;、,，\n]+/).map(x => x.trim()).filter(Boolean).forEach(x => {
+    const m = x.match(/^(.*?)[\s:：]+(\S+)$/); out.push(m ? [m[1], m[2]] : [x, '']);
+  });
+  return out;
+}
+/** 表格模型：rows[{cells:[{t:[行], span, c 置中, vc 垂直置中, sh 灰底, g 成績}], cls}] */
+function termOf(stu, grades){ const t = (grades && grades._term) || (stu && stu.pdfGrades && stu.pdfGrades._term) || 'second'; return t === 'year' ? '全學年' : '下學期'; }
+function formModel(stu, rec){
+  const r = rec || {};
+  const g = (r.grades && Object.keys(r.grades).length) ? r.grades : (stu.grades || {});
+  const L = (t, span, o) => Object.assign({ t: [].concat(t), span, c: true }, o || {});
+  const V = (t, span, o) => Object.assign({ t: [].concat(t == null ? '' : t), span }, o || {});
+  const lab = k => k ? SUBJ[k].l : '';
+  const val = k => k ? (g[k] || '') : '';
+  const subjRow = (a, b, c, d) => ({ cells: [
+    L(lab(a), 1, { vc: true }), V(val(a), 2, { g: true }), L(lab(b), 2, { vc: true }), V(val(b), 1, { g: true }),
+    L(lab(c), 1, { vc: true }), V(val(c), 2, { g: true }), L(lab(d), 2, { vc: true }), V(val(d), 1, { g: true }) ] });
+  const oth = parseOthers(g, r.otherSubjects);
+  const o = i => oth[i] || ['', ''];
+  const rows = [
+    { cells: [L('會面日期', 3), V(r.date, 3), L('負責老師', 3), V(r.teacher, 3)] },
+    { cells: [L(['會面時間', '(約歷時/分鐘)'], 3), V(r.duration, 3), L(r.s6meet ? ['中六面見', r.s6meet] : '中六面見', 3), V('備註：' + (r.note || ''), 3)] },
+    { cells: [L('學生姓名', 2), V(stu.eng ? [stu.chi, stu.eng] : stu.chi, 2), L('班級', 2), V(stu.cls, 2), L('學號', 2), V(stu.no, 2)] },
+    { cells: [V('學生基本資料', 12, { sh: true })] },
+    { cells: [L('最近一次考試成績', 4, { vc: true }), V('中五 ' + termOf(stu, g), 8)] },
+    subjRow('chi', 'eng', 'math', 'csd'),
+    subjRow('phy', 'chem', 'bio', 'm2'),
+    subjRow('geo', 'hist', 'chi_hist', ''),
+    subjRow('econ', 'bafs', 'th', 'va'),
+    { cells: [L('其他', 1, { vc: true }), V(o(0).filter(Boolean).join(' '), 2, { g: true }),
+      V(o(1)[0], 2, { c: true }), V(o(1)[1], 1, { g: true }), V(o(2)[0], 1, { c: true }), V(o(2)[1], 2, { g: true }),
+      V(o(3)[0], 2, { c: true }), V(o(3)[1], 1, { g: true })] },
+    { cells: [L('Probe', 4, { vc: true }), V(r.probe, 8)], cls: 'mid' },
+    { cells: [L('HOLLAND CODE (首三項，如有)', 4, { vc: true }), V(r.holland, 8)] },
+    { cells: [L('夢想的職業', 4, { vc: true }), V(r.career, 8)] },
+    { cells: [L('夢想升讀的課程', 4, { vc: true }), V(r.course, 8)] },
+    { cells: [L('Jupas首三', 4, { vc: true }), V(r.jupas, 8)] },
+    { cells: [V('會見後老師給予的意見 / 引導同學選擇的結果', 12, { sh: true })] },
+    { cells: [L('關於學科選擇', 4), V(r.opSubject, 8)], cls: 'tall' },
+    { cells: [L('關於職業選擇', 4), V(r.opCareer, 8)], cls: 'tall' },
+    { cells: [L('關於未來可以考慮的行動', 4), V(r.opAction, 8)], cls: 'tall' },
+    { cells: [L('其他', 4), V(r.opOther, 8)], cls: 'tall' }
+  ];
+  return { header: ['漢華中學', '升學及就業輔導組', '個人輔導紀錄表 中六' + yearDisp(stu.year)], rows };
+}
+function formHTML(stu, rec, forWord){
+  const m = formModel(stu, rec);
+  const total = FORM_GRID.reduce((a, b) => a + b, 0);
+  const cols = FORM_GRID.map(w => forWord ? `<col width="${Math.round(w / 15)}">` : `<col style="width:${(w / total * 100).toFixed(3)}%">`).join('');
+  const rows = m.rows.map(row => `<tr class="${row.cls || ''}">` + row.cells.map(c => {
+    const cls = [c.c || c.g ? 'c' : '', c.vc ? 'vc' : '', c.sh ? 'sh' : '', c.g ? 'g' : ''].filter(Boolean).join(' ');
+    const st = forWord ? ` style="border:solid windowtext .5pt;padding:0 5.4pt;${c.c || c.g ? 'text-align:center;' : ''}${c.vc ? 'vertical-align:middle;' : 'vertical-align:top;'}${c.sh ? 'background:#BFBFBF;' : ''}${c.g ? 'font-weight:bold;' : ''}"` : '';
+    return `<td colspan="${c.span}" class="${cls}"${st}>${c.t.map(escBr).join('<br>')}</td>`;
+  }).join('') + '</tr>').join('');
+  return `<div class="form-page"><p class="hd">${esc(m.header[0])}</p><p class="hd">${esc(m.header[1])}</p><p class="hd">${esc(m.header[2])}</p><p class="hd-gap">&nbsp;</p>` +
+    `<table${forWord ? ' border="1" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:none;width:481.4pt"' : ''}><colgroup>${cols}</colgroup>${rows}</table></div>`;
+}
+
+/* 匯出對話框：預設為「正在編輯」的紀錄 */
+function openExport(recId){
+  const s = cur(); if (!s) { toast('請先選擇學生', 'error'); return; }
+  const recs = recsOf(s);
+  const opts = [`<option value="__form">目前表格內容（${S.curRecId ? '編輯中' : '未儲存的新面談'}）</option>`].concat(
+    recs.map((r, i) => `<option value="${esc(r.id)}">第 ${i + 1} 次　${esc(r.date || '')}　${esc(r.teacher || '')}</option>`));
+  $('exportRec').innerHTML = opts.join('');
+  const want = typeof recId === 'string' ? recId : (S.curRecId && !S.dirty ? S.curRecId : '__form');
+  $('exportRec').value = recs.some(r => r.id === want) ? want : '__form';
+  renderExportPreview(); openModal('exportModal');
+}
+function exportSel(){
+  const s = cur(); if (!s) return null;
+  const v = $('exportRec').value;
+  if (v === '__form') return { stu: s, rec: Object.assign({ grades: Object.assign({}, S.formGrades) }, getForm()) };
+  const r = S.records.find(x => x.id === v); return r ? { stu: s, rec: r } : null;
+}
+function renderExportPreview(){ const x = exportSel(); $('exportPreview').innerHTML = x ? formHTML(x.stu, x.rec) : ''; }
+function fileBase(x){ return `個人輔導紀錄表_${x.stu.cls}-${x.stu.no}_${safeFile(x.stu.chi)}_${x.rec.date || todayHK()}`; }
+
+function printForms(list){
+  $('printArea').innerHTML = list.map(x => formHTML(x.stu, x.rec)).join('');
+  document.body.classList.add('printing');
+  api('apiLog', '列印紀錄表', list.length + ' 份').catch(() => {});
+  setTimeout(() => { window.print(); setTimeout(() => document.body.classList.remove('printing'), 500); }, 50);
+}
+function printDocHTML(list){
+  const css = Array.from(document.querySelectorAll('style')).map(s => s.textContent).join('\n');
+  return `<!DOCTYPE html><html lang="zh-Hant-HK"><head><meta charset="UTF-8"><title>個人輔導紀錄表</title><style>${css}
+    body{background:#fff} #printArea{display:block} @media screen{.form-page{margin:10mm auto;box-shadow:0 0 6px rgba(0,0,0,.2);padding:20mm;width:210mm;box-sizing:border-box}}</style></head>
+    <body><div id="printArea">${list.map(x => formHTML(x.stu, x.rec)).join('')}</div><script>setTimeout(function(){window.print()},400)<\/script></body></html>`;
+}
+function openPrintWindow(list){
+  const w = window.open('', '_blank');
+  if (!w) { toast('瀏覽器阻擋了彈出視窗，請改用「列印 / 另存 PDF」', 'error'); return; }
+  w.document.open(); w.document.write(printDocHTML(list)); w.document.close();
+}
+
+/* .doc（Word 相容 HTML） */
+function downloadDoc(list, base){
+  const body = list.map((x, i) => (i ? '<br clear="all" style="page-break-before:always">' : '') + formHTML(x.stu, x.rec, true)).join('');
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head><meta charset="UTF-8"><meta name="ProgId" content="Word.Document"><!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml><![endif]-->
+<style>@page WordSection1{size:595.3pt 841.9pt;margin:56.7pt 56.7pt 56.7pt 56.7pt}div.WordSection1{page:WordSection1}
+body{font-family:"新細明體","PMingLiU",serif;font-size:12pt}p.hd{text-align:center;font-weight:bold;margin:0;line-height:150%}
+td{font-family:"新細明體","PMingLiU",serif;font-size:12pt;line-height:150%}tr.tall td{height:70pt}tr.mid td{height:36pt}</style></head>
+<body><div class="WordSection1">${body}</div></body></html>`;
+  download(base + '.doc', new Blob(['\ufeff' + html], { type: 'application/msword;charset=utf-8' }));
+  api('apiLog', '匯出 Word (.doc)', list.length + ' 份').catch(() => {});
+  toast('✓ 已下載 Word 相容檔（.doc）', 'success');
+}
+
+/* .docx（純前端產生，不需外部程式庫） */
+function xmlEsc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ''); }
+function docxRun(text, bold){
+  return String(text).split(/\r?\n/).map((p, i) => (i ? '<w:r><w:br/></w:r>' : '') + `<w:r><w:rPr><w:rFonts w:hint="eastAsia"/>${bold ? '<w:b/>' : ''}</w:rPr><w:t xml:space="preserve">${xmlEsc(p)}</w:t></w:r>`).join('');
+}
+function docxForm(stu, rec){
+  const m = formModel(stu, rec);
+  const head = m.header.map(h => `<w:p><w:pPr><w:jc w:val="center"/><w:rPr><w:b/></w:rPr></w:pPr>${docxRun(h, true)}</w:p>`).join('') + '<w:p/>';
+  const rows = m.rows.map(row => {
+    let col = 0;
+    const h = row.cls === 'tall' ? '<w:trPr><w:trHeight w:val="1400"/></w:trPr>' : row.cls === 'mid' ? '<w:trPr><w:trHeight w:val="720"/></w:trPr>' : '';
+    return `<w:tr>${h}` + row.cells.map(c => {
+      const w = FORM_GRID.slice(col, col + c.span).reduce((a, b) => a + b, 0); col += c.span;
+      const pPr = `<w:pPr><w:spacing w:line="360" w:lineRule="auto"/>${c.c || c.g ? '<w:jc w:val="center"/>' : ''}</w:pPr>`;
+      const paras = c.t.map(t => `<w:p>${pPr}${t ? docxRun(t, !!c.g) : ''}</w:p>`).join('') || `<w:p>${pPr}</w:p>`;
+      return `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/>${c.span > 1 ? `<w:gridSpan w:val="${c.span}"/>` : ''}${c.sh ? '<w:shd w:val="clear" w:color="auto" w:fill="BFBFBF"/>' : ''}${c.vc ? '<w:vAlign w:val="center"/>' : ''}</w:tcPr>${paras}</w:tc>`;
+    }).join('') + '</w:tr>';
+  }).join('');
+  const b = ['top','left','bottom','right','insideH','insideV'].map(x => `<w:${x} w:val="single" w:sz="4" w:space="0" w:color="auto"/>`).join('');
+  return head + `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>${b}</w:tblBorders><w:tblLayout w:type="fixed"/><w:tblLook w:val="04A0"/></w:tblPr><w:tblGrid>${FORM_GRID.map(x => `<w:gridCol w:w="${x}"/>`).join('')}</w:tblGrid>${rows}</w:tbl>`;
+}
+const CT_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>';
+const RELS_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>';
+const DOC_RELS_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+const STYLES_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Times New Roman" w:eastAsia="新細明體" w:hAnsi="Times New Roman" w:cs="Times New Roman"/><w:kern w:val="2"/><w:sz w:val="24"/><w:szCs w:val="22"/><w:lang w:val="en-US" w:eastAsia="zh-HK"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:widowControl w:val="0"/></w:pPr></w:style></w:styles>';
+function buildDocx(list){
+  const body = list.map((x, i) => (i ? '<w:p><w:r><w:br w:type="page"/></w:r></w:p>' : '') + docxForm(x.stu, x.rec)).join('');
+  const doc = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>' + body +
+    '<w:p/><w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="851" w:footer="992" w:gutter="0"/></w:sectPr></w:body></w:document>';
+  return zipStore([['[Content_Types].xml', CT_XML], ['_rels/.rels', RELS_XML], ['word/_rels/document.xml.rels', DOC_RELS_XML], ['word/document.xml', doc], ['word/styles.xml', STYLES_XML]]);
+}
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b){ let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function zipStore(files){ // 極簡 ZIP（STORE，不壓縮）
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  const u16 = v => [v & 255, (v >>> 8) & 255], u32 = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  files.forEach(([name, text]) => {
+    const nb = enc.encode(name), data = enc.encode(text), crc = crc32(data);
+    const common = [...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(nb.length), ...u16(0)];
+    const lh = new Uint8Array([...u32(0x04034b50), ...common]);
+    parts.push(lh, nb, data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...common, ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(off)]), nb);
+    off += lh.length + nb.length + data.length;
+  });
+  const cdSize = central.reduce((a, b) => a + b.length, 0);
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(off), ...u16(0)]);
+  return new Blob([...parts, ...central, end], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+}
+function downloadDocx(list, base){
+  download(base + '.docx', buildDocx(list));
+  api('apiLog', '匯出 Word (.docx)', list.length + ' 份').catch(() => {});
+  toast('✓ 已下載 Word 檔（.docx）', 'success');
+}
+
+/* 全班匯出 */
+function openClassExport(){
+  const cls = classesOf(yearStudents());
+  if (!cls.length) { toast('此學年未有學生', 'error'); return; }
+  $('ceClass').innerHTML = `<option value="ALL">全部班別</option>` + cls.map(c => `<option value="${esc(c)}"${c === S.classFilter ? ' selected' : ''}>${esc(c)}</option>`).join('');
+  updateClassExportInfo(); openModal('classExportModal');
+}
+function classExportList(){
+  const c = $('ceClass').value, which = $('ceWhich').value, out = [];
+  yearStudents().filter(s => c === 'ALL' || s.cls === c).sort(sortStu)
+    .forEach(s => { const r = recsOf(s); if (!r.length) return; (which === 'all' ? r : [r[r.length - 1]]).forEach(rec => out.push({ stu: s, rec })); });
+  if (!out.length) toast('所選班別未有面談紀錄', 'error');
+  return out;
+}
+function updateClassExportInfo(){
+  const c = $('ceClass').value;
+  const stus = yearStudents().filter(s => c === 'ALL' || s.cls === c);
+  $('ceInfo').textContent = `${c === 'ALL' ? '全部班別' : c + ' 班'}：學生 ${stus.length} 位，已面談 ${stus.filter(hasRec).length} 位（未面談的學生不會匯出紀錄表）。`;
+}
+function classFileBase(){ return `全班輔導紀錄表_${yearDisp(S.year).replace('/', '-')}_${$('ceClass').value === 'ALL' ? '全部' : $('ceClass').value}_${todayHK()}`; }
+function classCsv(){
+  const c = $('ceClass').value;
+  const head = ['學年','班別','學號','中文姓名','英文姓名','面談次數','最近會面日期','負責老師','中六面見','參考最佳五科','核心最低要求','夢想的職業','Jupas首三'];
+  const cellv = v => { let s = String(v == null ? '' : v); if (/^[=+\-@]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  const lines = [head.map(cellv).join(',')];
+  yearStudents().filter(s => c === 'ALL' || s.cls === c).sort(sortStu).forEach(s => {
+    const r = recsOf(s), last = r[r.length - 1] || {}, d = calcDSE(last.grades && Object.keys(last.grades).length ? last.grades : s.grades);
+    lines.push([yearDisp(s.year), s.cls, s.no, s.chi, s.eng, r.length, last.date, last.teacher, last.s6meet, d.best5.length ? d.total : '', d.req.text, last.career, last.jupas].map(cellv).join(','));
+  });
+  download(classFileBase() + '.csv', new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' }));
+}
+
+/* ═════════ PDF 成績表 ═════════ */
+let pdfjs = null;
+async function loadPdfJs(){
+  if (pdfjs) return pdfjs;
+  pdfjs = await import(PDFJS_BASE + 'pdf.min.mjs');
+  // 於主執行緒載入 worker 模組（pdf.js「fake worker」），避免 Apps Script 沙盒內跨網域 Worker 被封鎖
+  window.pdfjsWorker = await import(PDFJS_BASE + 'pdf.worker.min.mjs');
+  return pdfjs;
+}
+function resetPdf(){
+  S.pdfParsed = []; S.pdfPages = null;
+  $('pdfUpload').classList.remove('hidden'); $('pdfProgress').classList.add('hidden'); $('pdfResult').classList.add('hidden');
+  $('pdfConfirm').classList.add('hidden'); $('pdfInput').value = '';
+}
+function pdfProgress(p, t){ $('pdfProgressBar').style.width = p + '%'; $('pdfProgressText').textContent = t; }
+async function extractPdfPages(data){
+  const lib = await loadPdfJs();
+  const pdf = await lib.getDocument({ data }).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const pg = await pdf.getPage(i); const tc = await pg.getTextContent();
+    const vw = pg.getViewport({ scale: 1 }).width;
+    pages.push(tc.items.filter(it => it.str != null).map(it => ({ text: it.str, x: Math.round(it.transform[4]), y: Math.round(it.transform[5]), w: it.width || 0, h: Math.abs(it.transform[3]) || 8, pw: vw })));
+    pdfProgress(10 + Math.round(i / pdf.numPages * 70), `解析第 ${i}/${pdf.numPages} 頁…`);
+  }
+  return pages;
+}
+async function handlePdf(file){
+  if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') { toast('請上載 PDF 格式的成績表', 'error'); return; }
+  if (!yearStudents().length) { toast('請先輸入此學年的學生名單，再上載成績表', 'error'); return; }
+  $('pdfUpload').classList.add('hidden'); $('pdfProgress').classList.remove('hidden'); $('pdfResult').classList.add('hidden');
+  pdfProgress(5, '載入 PDF 解析器…');
+  try {
+    const pages = await extractPdfPages(await file.arrayBuffer());
+    S.pdfPages = pages;
+    S.pdfParsed = matchParsed(parseEclassPages(pages, pdfTerm()));
+    pdfProgress(100, '解析完成'); showPdfResult();
+  } catch (e) {
+    console.error(e);
+    pdfProgress(100, '❌ 解析失敗：' + e.message); toast('PDF 解析失敗，請確認格式', 'error');
+  }
+}
+// NFKC 未涵蓋的 CJK 部首補充區相容字
+const RADICAL_FIX = { '⺠':'民', '⻑':'長', '⻝':'食', '⻄':'西', '⻘':'青', '⻆':'角', '⻣':'骨', '⻤':'鬼', '⻩':'黃', '⻬':'齊', '⻯':'龍', '⻲':'龜', '⺟':'母', '⺠':'民', '⻓':'長' };
+function cjkNorm(t){ return String(t || '').normalize('NFKC').replace(/[\u2E80-\u2EFF]/g, c => RADICAL_FIX[c] || c); }
+function pageFlat(items){
+  // NFKC：把康熙部首等相容字（如「⽣」「⼤」）還原為一般漢字；再合併被拆開的中文字
+  return items.filter(i => i.text && i.text.trim()).sort((a, b) => b.y - a.y || a.x - b.x)
+    .map(i => cjkNorm(i.text).trim()).join(' ')
+    .replace(/([\u3400-\u9fff])\s+(?=[\u3400-\u9fff])/g, '$1');
+}
+/** 成績欄設定：'second' = 下學期（預設，即中五下學期）；'year' = 全學年 */
+function pdfTerm(){ try { return localStorage.getItem('hw6_pdfTerm') === 'year' ? 'year' : 'second'; } catch (e) { return 'second'; } }
+function setPdfTerm(v){ try { localStorage.setItem('hw6_pdfTerm', v); } catch (e) {} }
+function parseEclassPages(pages, term){
+  term = term || pdfTerm();
+  const out = [];
+  pages.forEach((items0, pi) => {
+    const items = items0.filter(i => i.text && i.text.trim()).map(i => Object.assign({}, i, { text: cjkNorm(i.text).trim() }));
+    const pw = (items[0] && items[0].pw) || 0;
+    // 漢華 eClass 為橫向版面：左半為成績表，右半為操行、活動等（忽略）
+    const left = pw ? items.filter(i => i.x < pw * 0.5) : items;
+    const flat = pageFlat(items); // 表頭（姓名、班別、班號）取自全頁
+    let chi = '', eng = '', cls = '', no = '';
+    const nm = flat.match(/(?:學生姓名|學生名稱|Name)\s*[:：]?\s*([\u3400-\u9fff]{2,6})\s*((?:[A-Z][A-Za-z'\-]*\s*){1,6}?)(?=\s*(?:班別|Class|性別|Sex|$))/);
+    if (nm) { chi = nm[1]; eng = (nm[2] || '').trim(); }
+    else { const m2 = flat.match(/(?:學生姓名|學生名稱|Name)\s*[:：]?\s*([\u3400-\u9fff]{2,6})/); if (m2) chi = m2[1]; }
+    if (!chi) return;
+    const cm = flat.match(/(?:班別|Class(?:\s*Name)?)\s*[:：]?\s*(S?\d[A-Z])(?![A-Za-z0-9])/i); if (cm) cls = normCls(cm[1]);
+    const nm3 = flat.match(/(?:班號|學號|Class\s*No\.?)\s*[:：]?\s*(\d{1,3})(?!\d)/i); if (nm3) no = normNo(nm3[1]);
+    const rm = flat.match(/(?:註冊編號|Reg\.?\s*no\.?)\s*[:：]?\s*(\d{6,12})/i); const reg = rm ? rm[1] : '';
+    const sm = flat.match(/(?:學生編號|STRN)\s*[:：]?\s*([A-Za-z]\d{6,8}[0-9A-Za-z()]?)/i); const strn = sm ? sm[1].toUpperCase() : '';
+    const grades = parseGradeTable(left, term);
+    out.push({ page: pi + 1, chi, eng, cls, pdfCls: cm ? cm[1].toUpperCase() : '', no, reg, strn, term, grades: grades || parseGradesFromFlat(pageFlat(left)) });
+  });
+  return out;
+}
+/** 以座標讀表：找出「下學期／全學年」欄的 x 位置，逐行取該欄成績，並以同一行左方的科目名稱辨認科目 */
+function parseGradeTable(items, term){
+  const cx = i => i.x + (i.w || 0) / 2;
+  const find = re => items.filter(i => re.test(i.text));
+  const hFull = find(/^(滿分|Full)/i)[0];
+  const hCol = term === 'year' ? find(/^(全學年|全年|Academic)/i)[0] : find(/^(下學期|Second)/i)[0];
+  if (!hFull || !hCol) return null;
+  const colX = cx(hCol), fullX = hFull.x, headY = Math.min(hFull.y, hCol.y);
+  // 所有欄位標題（滿分、上學期、名次、下學期、全學年）：每個成績歸入最近的欄
+  const heads = items.filter(i => Math.abs(i.y - hFull.y) <= 40 && /^(滿分|Full|上學期?|First|名次|Rank|下學期|Second|全學年|全年|Academic)/i.test(i.text)).map(cx);
+  const nearestHead = x => heads.reduce((b, h) => Math.abs(h - x) < Math.abs(b - x) ? h : b, heads[0]);
+  const cells = items.filter(i => i.y < headY - 2 && i.x > fullX && GRADE_TOKEN.test(i.text) && Math.abs(nearestHead(cx(i)) - colX) < 1);
+  const labels = items.filter(i => i.x + (i.w || 0) <= fullX + 2 && i.y < headY - 2);
+  // 每行以「滿分」欄（5**）為錨點，取上下中點為行界，合併該行所有科目名稱文字（處理換行的英文科名）
+  const anchors = items.filter(i => i.y < headY - 2 && Math.abs(nearestHead(cx(i)) - cx(hFull)) < 1 && /^5\*\*$/.test(i.text)).map(i => i.y).sort((a, b) => b - a);
+  const band = y => {
+    if (!anchors.length) return [y - 6, y + 6];
+    let k = 0; anchors.forEach((a, j) => { if (Math.abs(a - y) < Math.abs(anchors[k] - y)) k = j; });
+    const a = anchors[k], up = k > 0 ? (anchors[k - 1] + a) / 2 : a + (k + 1 < anchors.length ? (a - anchors[k + 1]) / 2 : 12);
+    const dn = k + 1 < anchors.length ? (a + anchors[k + 1]) / 2 : a - (k > 0 ? (anchors[k - 1] - a) / 2 : 12);
+    return [dn, up];
+  };
+  const grades = {};
+  cells.forEach(c => {
+    const [lo, hi] = band(c.y);
+    const ls = labels.filter(l => l.y > lo && l.y < hi).sort((a, b) => (a.x < fullX / 2) === (b.x < fullX / 2) ? b.y - a.y || a.x - b.x : a.x - b.x);
+    if (!ls.length) return;
+    const txt = ls.map(l => l.text).join(' ').replace(/([\u3400-\u9fff])\s+(?=[\u3400-\u9fff])/g, '$1').replace(/\s+/g, ' ');
+    if (/卷|Paper|閱讀|寫作|聆聽|說話|Reading|Writing|Listening|Speaking/i.test(txt)) return; // 子卷略過
+    let key = null;
+    for (const d of SUBJECT_DEFS) { d.re.lastIndex = 0; if (d.re.test(txt)) { key = d.key; break; } }
+    if (!key || grades[key]) return;
+    let g = c.text;
+    if (key === 'csd') g = csdNorm(g); else if (!(g in SCORE)) return;
+    grades[key] = g;
+  });
+  return Object.keys(grades).length ? grades : null;
+}
+// 科目關鍵字（收緊：M1/M2 須為獨立字詞；「歷史」排除「中國歷史」；企財須完整科名）
+const SUBJECT_DEFS = [
+  { key: 'chi_hist', re: /中國歷史|Chinese History/g },
+  { key: 'm2', re: /數學延伸部分\s*單元二|Extended Part\s*Module\s*2|Module\s*2\s*\(?Algebra and Calculus\)?|(?<![A-Za-z0-9])M2(?![A-Za-z0-9])/g },
+  { key: 'chi', re: /中國語文|Chinese Language/g },
+  { key: 'eng', re: /英國語文|English Language/g },
+  { key: 'math', re: /數學(?!\s*延伸)(?:\s*必修部分)?|Mathematics(?!\s*Extended)(?:\s*Compulsory Part)?/g },
+  { key: 'csd', re: /公民與社會發展(?:科)?|Citizenship and Social Development/g },
+  { key: 'phy', re: /物理|Physics/g },
+  { key: 'chem', re: /化學|Chemistry/g },
+  { key: 'bio', re: /生物|Biology/g },
+  { key: 'geo', re: /地理|Geography/g },
+  { key: 'hist', re: /(?<!中國)歷史|(?<!Chinese\s)History/g },
+  { key: 'econ', re: /經濟|Economics/g },
+  { key: 'bafs', re: /企業、?會計與財務概論|Business,?\s*Accounting and Financial Studies|(?<![A-Za-z])BAFS(?![A-Za-z])/g },
+  { key: 'th', re: /旅遊與款待|Tourism and Hospitality(?: Studies)?/g },
+  { key: 'va', re: /視覺藝術|Visual Arts/g },
+  { key: 'music', re: /音樂|Music/g },
+  { key: 'pe', re: /體育|Physical Education/g }
+];
+const GRADE_TOKEN = /^(5\*\*|5\*|[1-5]|U|達標|不達標|A|B|C|Attained)$/;
+function parseGradesFromFlat(flat){
+  const hits = [];
+  SUBJECT_DEFS.forEach(d => { d.re.lastIndex = 0; let m; while ((m = d.re.exec(flat))) hits.push({ key: d.key, i: m.index, end: m.index + m[0].length }); });
+  hits.sort((a, b) => a.i - b.i || (b.end - b.i) - (a.end - a.i));
+  const clean = []; let lastEnd = -1;
+  hits.forEach(h => { if (h.i >= lastEnd) { clean.push(h); lastEnd = h.end; } });
+  const grades = {};
+  clean.forEach((h, idx) => {
+    if (grades[h.key]) return;
+    const after = flat.slice(h.end, h.end + 30);
+    if (/^\s*[（(]?\s*(?:卷\s*[一二三四五]|Paper\s*\d|Reading|Writing|Listening|Speaking|閱讀|寫作|聆聽|說話)/i.test(after)) return; // 子卷略過
+    const stop = idx + 1 < clean.length ? clean[idx + 1].i : Math.min(flat.length, h.end + 400);
+    const seg = flat.slice(h.end, stop);
+    const fm = seg.search(/5\*\*/); // 滿分欄（5**）之後才是成績
+    const tail = fm >= 0 ? seg.slice(fm + 3) : seg;
+    const toks = tail.split(/\s+/).filter(t => !/^[(（\[].*[)）\]]$/.test(t)).filter(t => GRADE_TOKEN.test(t)).slice(0, 4); // 括號內為名次，略過
+    let g = toks.length >= 3 ? toks[2] : toks.length === 2 ? toks[1] : toks[0];
+    if (!g) return;
+    if (h.key === 'csd') g = csdNorm(g);
+    else if (!(g in SCORE)) return;
+    grades[h.key] = g;
+  });
+  return grades;
+}
+/** 以 中文姓名＋班別（＋學號）配對目前學年名單；同名或不符時提示 */
+/** 配對優先次序：註冊編號 → STRN → 中文姓名（該學年唯一）→ 否則 ⚠ 人手選擇。中五班別／班號只作參考，不作配對。 */
+function matchParsed(parsed){
+  const roster = yearStudents();
+  const norm = v => String(v || '').trim().toUpperCase();
+  return parsed.map(p => {
+    const s5 = `${p.pdfCls || p.cls || '?'}-${p.no || '?'}`;
+    const base = Object.assign({}, p, { s5 });
+    const idHit = (field, label) => {
+      if (!p[field]) return null;
+      const hit = roster.filter(s => norm(s[field]) && norm(s[field]) === norm(p[field]));
+      if (hit.length !== 1) return null;
+      const s = hit[0];
+      if (s.chi !== p.chi) return Object.assign(base, { via: label, status: 'warn', note: `${label}相符但姓名不同（PDF：${p.chi}，名單：${s.chi}）；已預設此學生，請確認`, target: skey(s), cands: [skey(s)].concat(roster.filter(x => x.chi === p.chi).map(skey)) });
+      return Object.assign(base, { via: label, status: 'ok', note: '', target: skey(s), cands: [skey(s)] });
+    };
+    const r = idHit('reg', '註冊編號') || idHit('strn', 'STRN');
+    if (r) return r;
+    const byName = roster.filter(s => s.chi === p.chi);
+    if (byName.length === 1) return Object.assign(base, { via: '中文姓名', status: 'ok', note: '', target: skey(byName[0]), cands: [skey(byName[0])] });
+    if (byName.length > 1) return Object.assign(base, { via: '—', status: 'amb', note: `名單中有 ${byName.length} 位同名學生，且註冊編號／STRN 未能配對，請選擇`, target: '', cands: byName.map(skey) });
+    return Object.assign(base, { via: '—', status: 'none', note: '不在目前學年名單內（註冊編號、STRN、姓名均未能配對），將略過', target: '', cands: [] });
+  });
+}
+function showPdfResult(){
+  $('pdfProgress').classList.add('hidden'); $('pdfResult').classList.remove('hidden');
+  const P = S.pdfParsed;
+  const n = st => P.filter(p => p.status === st).length;
+  $('pdfSummary').innerHTML = `成績欄：<b>${P[0] && P[0].term === 'year' ? '全學年' : '下學期（中五下學期）'}</b>。配對次序：<b>註冊編號 → STRN → 中文姓名（該學年唯一）</b>；中五班別／班號只作參考。<br>PDF 共 <b>${P.length}</b> 位學生：<span class="ok">配對 ${n('ok')}</span>、<span class="warn">姓名不符 ${n('warn')}</span>、<span class="warn">同名待選 ${n('amb')}</span>、名單外 ${n('none')}（略過）。<br><span class="note">「✓ 配對」會自動匯入；「⚠ 姓名不符」已預設為編號相符的學生，請核對（可改選或選「略過」）；「同名待選」須人手選擇，否則略過。</span>`;
+  const keyName = k => { const s = S.students.find(x => skey(x) === k); return s ? `${s.cls}-${s.no} ${s.chi}` : k; };
+  $('pdfTable').innerHTML = `<thead><tr><th>頁</th><th>PDF 姓名／中五班別</th><th>配對方法</th><th>匯入至</th><th>中</th><th>英</th><th>數</th><th>公民</th><th>其他</th><th>狀態</th></tr></thead><tbody>` +
+    P.map((p, i) => {
+      const g = p.grades;
+      const target = (p.status === 'warn' || p.status === 'amb')
+        ? `<select class="select" data-pi="${i}" style="padding:3px 6px"><option value="">（略過）</option>${p.cands.map(k => `<option value="${esc(k)}"${k === p.target ? ' selected' : ''}>${esc(keyName(k))}</option>`).join('')}</select>`
+        : (p.target ? esc(keyName(p.target)) : '—');
+      const others = Object.keys(g).filter(k => !CORE.includes(k)).map(k => SUBJ[k].l + ' ' + g[k]).join('、');
+      const stTxt = { ok: '<span class="ok">✓ 配對</span>', warn: '<span class="warn">⚠ ' + esc(p.note) + '</span>', amb: '<span class="warn">⚠ ' + esc(p.note) + '</span>', none: '<span class="note">' + esc(p.note) + '</span>' }[p.status];
+      return `<tr><td>${p.page}</td><td>${esc(p.chi)} ${esc(p.pdfCls || p.cls)}${p.no ? '-' + esc(p.no) : ''}<div class="note" style="margin:0">${esc(p.eng)}</div></td><td style="font-size:12px;white-space:nowrap">${esc(p.via || '—')}${p.reg || p.strn ? `<div class="note" style="margin:0">${esc([p.reg, p.strn].filter(Boolean).join(' / '))}</div>` : ''}</td><td>${target}</td>
+        <td class="${gradeClass(g.chi)}">${esc(g.chi || '—')}</td><td class="${gradeClass(g.eng)}">${esc(g.eng || '—')}</td><td class="${gradeClass(g.math)}">${esc(g.math || '—')}</td><td class="${gradeClass(g.csd)}">${esc(g.csd || '—')}</td><td style="font-size:12px">${esc(others)}</td><td>${stTxt}</td></tr>`;
+    }).join('') + '</tbody>';
+  $('pdfTable').querySelectorAll('select[data-pi]').forEach(sel => sel.addEventListener('change', () => { S.pdfParsed[+sel.dataset.pi].target = sel.value; }));
+  $('pdfConfirm').classList.toggle('hidden', !P.some(p => p.cands.length));
+}
+async function confirmPdf(){
+  const used = new Set(), list = [];
+  S.pdfParsed.filter(p => p.target).forEach(p => {
+    if (used.has(p.target)) return; used.add(p.target);
+    const s = S.students.find(x => skey(x) === p.target); if (s) list.push({ s, p });
+  });
+  if (!list.length) { toast('沒有選擇任何學生', 'error'); return; }
+  const payload = list.map(({ s, p }) => ({ year: s.year, cls: s.cls, no: s.no, chi: s.chi, eng: s.eng || p.eng || '', reg: s.reg || p.reg || '', strn: s.strn || p.strn || '', grades: Object.assign({}, p.grades), pdfGrades: Object.assign({ _term: p.term }, p.grades) }));
+  loading(true);
+  try { await call('apiUpsertStudents', [payload, {}], '匯入成績…'); } catch (e) { loading(false); return; }
+  loading(false);
+  list.forEach(({ s, p }) => { s.grades = Object.assign({}, p.grades); s.pdfGrades = Object.assign({ _term: p.term }, p.grades); if (!s.eng && p.eng) s.eng = p.eng; if (!s.reg && p.reg) s.reg = p.reg; if (!s.strn && p.strn) s.strn = p.strn; });
+  closeModal('pdfModal'); resetPdf();
+  if (cur() && !S.curRecId) S.formGrades = Object.assign({}, cur().grades);
+  renderAll();
+  toast(`✓ 已更新 ${list.length} 位學生的成績`, 'success');
+}
+
+/* ═════════ 備份／還原（含 V5 匯入）═════════ */
+async function exportBackup(){
+  loading(true);
+  let d; try { d = await call('apiExportBackup', [], '準備備份…'); } catch (e) { loading(false); return; }
+  loading(false);
+  download(`輔導系統V6備份_${todayHK()}.json`, new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }));
+  toast(`✓ 已備份 ${d.years.length} 個學年、${d.students.length} 位學生、${d.records.length} 份紀錄`, 'success');
+}
+function simpleHash(s){ let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); }
+function mapV5Grades(g){
+  const o = {};
+  Object.keys(g || {}).forEach(k => {
+    const v = String(g[k] || '').trim(); if (!v) return;
+    if (k === 'ls') { o.csd = csdNorm(v); return; }
+    if (SUBJ[k] && v in SCORE) o[k] = v;
+  });
+  return o;
+}
+/** V5 備份（version 2 多學年／version 1 單學年）→ V6 格式 */
+function convertV5(b){
+  let data;
+  if (b.version === 2 && b.data) data = b.data;
+  else if (Array.isArray(b.students) && b.records && !Array.isArray(b.records)) data = { [b.schoolYear || S.year]: { students: b.students, records: b.records } };
+  else throw new Error('不是 V5 或 V6 備份格式');
+  const students = [], records = [], warnings = [], years = [];
+  Object.keys(data).forEach(y => {
+    if (!/^\d{4}-\d{2}$/.test(y)) { warnings.push('略過不明學年：' + y); return; }
+    years.push(y);
+    const d = data[y] || {}; let auto = 0;
+    const conv = (d.students || []).filter(s => s && s.chi_name).map(s => {
+      let no = normNo(s.class_no);
+      if (!no) { no = 'X' + (++auto); warnings.push(`${yearDisp(y)} ${s.chi_name}：沒有學號，暫定為 ${no}，請於試算表更正`); }
+      const g = mapV5Grades(s.grades);
+      return { year: y, cls: normCls(s.class), no, chi: s.chi_name, eng: s.eng_name || '', reg: String(s.reg_no || s.regNo || s.reg || '').trim(), strn: String(s.strn || s.STRN || '').trim().toUpperCase(), remarks: s.remarks || '', grades: g, pdfGrades: g };
+    });
+    students.push(...conv);
+    Object.keys(d.records || {}).forEach(name => {
+      const list = d.records[name] || [];
+      if (!list.length) return;
+      const cands = conv.filter(s => s.chi === name);
+      if (!cands.length) { warnings.push(`${yearDisp(y)}「${name}」有 ${list.length} 份紀錄，但名單內沒有此學生 → 略過`); return; }
+      if (cands.length > 1) warnings.push(`${yearDisp(y)}「${name}」有 ${cands.length} 位同名學生（${cands.map(c => c.cls + '-' + c.no).join('、')}）。V5 以姓名儲存紀錄，已全部歸入 ${cands[0].cls}-${cands[0].no}，請人手核對`);
+      const s = cands[0];
+      list.forEach(r => {
+        records.push({ id: 'V5' + simpleHash(y + '|' + name + '|' + (r.timestamp || '') + '|' + (r.date || '')), year: y, cls: s.cls, no: s.no, chi: s.chi,
+          date: r.date || '', teacher: r.teacher || '', duration: r.duration || '', s6meet: '', note: r.note || '', probe: r.probe || '', holland: r.holland || '',
+          career: r.career || '', course: r.course || '', jupas: r.jupas || '', opSubject: r.opSubject || '', opCareer: r.opCareer || '', opAction: r.opAction || '',
+          opOther: r.opOther || '', otherSubjects: '', grades: mapV5Grades(r.grades),
+          createdBy: 'V5 匯入', createdAt: r.timestamp ? hkFromMs(r.timestamp) : '', importing: true });
+      });
+    });
+  });
+  return { years, students, records, warnings, source: 'V5' };
+}
+function readRestoreFile(file){
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      const b = JSON.parse(rd.result);
+      let p;
+      if (b.version === 6 && Array.isArray(b.students)) p = { years: b.years || [...new Set(b.students.map(s => s.year))], students: b.students, records: b.records || [], classDefaults: b.classDefaults || [], warnings: [], source: 'V6' };
+      else p = convertV5(b);
+      S.restorePayload = p;
+      $('restoreInfo').innerHTML = `<b>${esc(p.source)} 備份</b>：${esc(file.name)}<br>學年：${esc(p.years.map(yearDisp).join('、'))}<br>學生 ${p.students.length} 位、面談紀錄 ${p.records.length} 份` +
+        (p.warnings.length ? `<div class="warn" style="margin-top:6px">⚠ ${p.warnings.length} 項提示：<ul style="margin:4px 0">${p.warnings.slice(0, 30).map(w => '<li>' + esc(w) + '</li>').join('')}</ul></div>` : '');
+      $('restorePreview').classList.remove('hidden');
+    } catch (e) { toast('無法讀取備份：' + e.message, 'error'); }
+  };
+  rd.readAsText(file);
+}
+async function doRestore(){
+  const p = S.restorePayload; if (!p) return;
+  const mode = $('restoreMode').value;
+  if (!confirm(`確定${mode === 'replace' ? '【覆蓋】' : '合併'}還原？\n學年：${p.years.map(yearDisp).join('、')}\n學生 ${p.students.length} 位、紀錄 ${p.records.length} 份` + (mode === 'replace' ? '\n\n⚠ 會先刪除試算表內上述學年的所有學生及紀錄！' : ''))) return;
+  loading(true);
+  let r;
+  try { r = await call('apiImportBackup', [{ years: p.years, students: p.students, records: p.records, classDefaults: p.classDefaults || [] }, mode], '還原中…'); } catch (e) { loading(false); return; }
+  try {
+    const d = await api('apiBootstrap');
+    S.years = d.years; S.students = d.students; S.records = d.records; S.classDefaults = d.classDefaults || []; normalizeData();
+  } catch (e) { toast('重新載入失敗：' + e.message, 'error'); }
+  loading(false);
+  S.curKey = null; S.dirty = false; S.restorePayload = null; $('restorePreview').classList.add('hidden'); closeModal('backupModal');
+  if (!S.years.includes(S.year)) S.year = p.years[0] || S.years[0];
+  renderAll();
+  toast(`✓ 還原完成：學生新增 ${r.students.added}、更新 ${r.students.updated}；紀錄新增 ${r.records} 份`, 'success');
+}
+
+/* 測試用掛鉤（不影響正式使用） */
+window.__hw6 = { S, parseGradeTable, csdPass, csdNorm, matchParsedFn: matchParsed, classDefaultTeacher, parseGradesFromFlat, parseEclassPages, matchParsed, convertV5, calcDSE, formModel, formHTML, buildDocx, extractPdfPages, esc, todayHK, printForms };
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+
+
+<div class="ov hidden" id="classTeacherModal"><div class="modal" style="max-width:440px">
+  <h3>班別預設負責老師</h3>
+  <p class="note">每班通常由一位老師負責面談。設定後，該班新增面談時若「負責老師」空白，會自動填入；已有內容的不會覆蓋。</p>
+  <div class="fg"><label>學年</label><div id="ctYear" style="font-weight:600"></div></div>
+  <div class="fg" style="margin-top:8px"><label for="ctClass">班別</label><select class="select" id="ctClass"></select></div>
+  <div class="fg" style="margin-top:8px"><label for="ctTeacher">預設負責老師</label><input class="input" id="ctTeacher" placeholder="老師姓名" maxlength="60"></div>
+  <div class="acts" style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px">
+    <button class="btn primary" id="btnSaveClassTeacher">💾 儲存</button>
+    <button class="btn" id="btnClearClassTeacher">清除設定</button>
+    <button class="btn" id="btnApplyClassTeacher" title="只填入負責老師空白的紀錄">套用到本班未填紀錄</button>
+    <button class="btn" data-close>關閉</button>
+  </div>
+</div></div>
+
+<script>
+(function(){ var b=document.getElementById('btnClearLocal'); if(b) b.addEventListener('click', function(){ window.__pagesClear && window.__pagesClear(); }); })();
+</script>
+</body>
