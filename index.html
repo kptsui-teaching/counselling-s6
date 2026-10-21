@@ -1343,7 +1343,7 @@ table.cmp td.chg{background:var(--accentbg)}
 <div class="ov hidden" id="importModal"><div class="modal">
   <h2>批量輸入學生名單</h2>
   <p>學年：<b id="importYear"></b>。每行一位學生，格式：<code>班別　學號　中文姓名　英文姓名　註冊編號　STRN</code>（英文姓名、註冊編號、STRN 均可省略；可直接由 eClass／Excel 複製欄位貼上）</p>
-  <p style="font-size:13px;color:var(--text3)">欄位以空格、Tab 或逗號分隔均可（可直接由 Excel / Google 試算表複製貼上）。英文姓名可省略。同一學年內「班別＋學號」已存在的學生會略過。</p>
+  <p style="font-size:13px;color:var(--text3)">欄位以空格、Tab 或逗號分隔均可（可直接由 Excel／eClass 複製貼上）。英文姓名可省略。同一學年內「班別＋學號」已存在的學生會略過。</p>
   <div class="pre">6A  1  陳智穎  CHAN CHI WING
 6A  2  陳衍安  CHAN HIN ON
 6B  1  張浩進</div>
@@ -1411,7 +1411,7 @@ table.cmp td.chg{background:var(--accentbg)}
 
 <div class="ov hidden" id="backupModal"><div class="modal">
   <h2>💾 備份與還原</h2>
-  <p>資料已即時儲存於學校 Google 試算表。備份檔可作額外保存或搬遷之用。</p>
+  <p>資料會<strong>自動保存在此瀏覽器</strong>（不會上傳到伺服器）。請定期匯出 JSON 備份，以便換電腦、清除瀏覽器資料後還原，或交另一位老師匯入。</p>
   <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
     <button class="btn primary" id="btnBackup">💾 匯出完整備份（JSON）</button>
     <button class="btn" id="btnRestore">📂 從備份還原 / 匯入 V5 備份</button>
@@ -1423,7 +1423,7 @@ table.cmp td.chg{background:var(--accentbg)}
     <div class="fg" style="margin-top:8px"><label for="restoreMode">還原方式</label>
       <select class="select" id="restoreMode">
         <option value="merge">合併（建議）：同一學生資料更新，已存在的紀錄不重複</option>
-        <option value="replace">覆蓋：先清空備份內所涉學年的資料再匯入</option>
+        <option value="replace">覆蓋：先清空本機上述學年的資料再匯入</option>
       </select></div>
     <div class="acts"><button class="btn primary" id="btnDoRestore">確認還原</button></div>
   </div>
@@ -1566,7 +1566,7 @@ async function init(){
     S.year = S.years.includes(pref) ? pref : (S.years.includes(defaultYear()) ? defaultYear() : S.years[S.years.length - 1]);
     $('userEmail').textContent = S.email;
   } catch (e) {
-    $('emptyState').innerHTML = `<div class="ic">⚠️</div><h2>未能載入資料</h2><p>${esc(e.message)}</p><p class="note">如顯示「未獲授權」，請聯絡系統管理員把你的學校電郵加入「授權老師」分頁。</p>`;
+    $('emptyState').innerHTML = `<div class="ic">⚠️</div><h2>未能載入資料</h2><p>${esc(e.message)}</p><p class="note">本機版：資料只在此瀏覽器。可嘗試重新整理，或用「備份／還原」匯入 JSON；必要時按「清除本機資料」後再還原。</p>`;
     loading(false); return;
   }
   loading(false);
@@ -1938,7 +1938,7 @@ function onGradeChange(e){
   if (v) S.formGrades[k] = v; else delete S.formGrades[k];
   sel.className = gradeClass(v); S.dirty = true;
   recalcDSE();
-  if (!S.curRecId) persistStudentGrades(S.formGrades); // 新增模式：同時更新學生現時成績（儲存至試算表）
+  if (!S.curRecId) persistStudentGrades(S.formGrades); // 新增模式：同時更新學生現時成績（同步更新學生現時成績）
 }
 function persistStudentGrades(grades){
   const s = cur(); if (!s) return;
@@ -2336,7 +2336,7 @@ let pdfjs = null;
 async function loadPdfJs(){
   if (pdfjs) return pdfjs;
   pdfjs = await import(PDFJS_BASE + 'pdf.min.mjs');
-  // 於主執行緒載入 worker 模組（pdf.js「fake worker」），避免 Apps Script 沙盒內跨網域 Worker 被封鎖
+  // 於主執行緒載入 worker 模組（pdf.js「fake worker」），避免跨網域 Worker 被瀏覽器封鎖
   window.pdfjsWorker = await import(PDFJS_BASE + 'pdf.worker.min.mjs');
   return pdfjs;
 }
@@ -2584,7 +2584,7 @@ function convertV5(b){
     const d = data[y] || {}; let auto = 0;
     const conv = (d.students || []).filter(s => s && s.chi_name).map(s => {
       let no = normNo(s.class_no);
-      if (!no) { no = 'X' + (++auto); warnings.push(`${yearDisp(y)} ${s.chi_name}：沒有學號，暫定為 ${no}，請於試算表更正`); }
+      if (!no) { no = 'X' + (++auto); warnings.push(`${yearDisp(y)} ${s.chi_name}：沒有學號，暫定為 ${no}，請於學生名單中更正`); }
       const g = mapV5Grades(s.grades);
       return { year: y, cls: normCls(s.class), no, chi: s.chi_name, eng: s.eng_name || '', reg: String(s.reg_no || s.regNo || s.reg || '').trim(), strn: String(s.strn || s.STRN || '').trim().toUpperCase(), remarks: s.remarks || '', grades: g, pdfGrades: g };
     });
@@ -2626,7 +2626,7 @@ function readRestoreFile(file){
 async function doRestore(){
   const p = S.restorePayload; if (!p) return;
   const mode = $('restoreMode').value;
-  if (!confirm(`確定${mode === 'replace' ? '【覆蓋】' : '合併'}還原？\n學年：${p.years.map(yearDisp).join('、')}\n學生 ${p.students.length} 位、紀錄 ${p.records.length} 份` + (mode === 'replace' ? '\n\n⚠ 會先刪除試算表內上述學年的所有學生及紀錄！' : ''))) return;
+  if (!confirm(`確定${mode === 'replace' ? '【覆蓋】' : '合併'}還原？\n學年：${p.years.map(yearDisp).join('、')}\n學生 ${p.students.length} 位、紀錄 ${p.records.length} 份` + (mode === 'replace' ? '\n\n⚠ 會先刪除此瀏覽器內上述學年的所有學生及紀錄！' : ''))) return;
   loading(true);
   let r;
   try { r = await call('apiImportBackup', [{ years: p.years, students: p.students, records: p.records, classDefaults: p.classDefaults || [] }, mode], '還原中…'); } catch (e) { loading(false); return; }
