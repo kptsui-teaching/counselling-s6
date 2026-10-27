@@ -1499,7 +1499,7 @@ function gradeClass(g){
 }
 /** 公民：漢華 eClass 以等級（1–5**）記錄；仍接受 達標／不達標 作後備 */
 function csdNorm(v){
-  v = String(v || '').trim();
+  v = unwrapGrade(String(v || '').trim());
   if (!v) return '';
   if (v in SCORE) return v;
   if (/^(達標|A|Attained)$/i.test(v)) return '達標';
@@ -2419,7 +2419,7 @@ function parseGradeTable(items, term){
   // 所有欄位標題（滿分、上學期、名次、下學期、全學年）：每個成績歸入最近的欄
   const heads = items.filter(i => Math.abs(i.y - hFull.y) <= 40 && /^(滿分|Full|上學期?|First|名次|Rank|下學期|Second|全學年|全年|Academic)/i.test(i.text)).map(cx);
   const nearestHead = x => heads.reduce((b, h) => Math.abs(h - x) < Math.abs(b - x) ? h : b, heads[0]);
-  const cells = items.filter(i => i.y < headY - 2 && i.x > fullX && GRADE_TOKEN.test(i.text) && Math.abs(nearestHead(cx(i)) - colX) < 1);
+  const cells = items.filter(i => i.y < headY - 2 && i.x > fullX && isGradeToken(i.text) && Math.abs(nearestHead(cx(i)) - colX) < 1);
   const labels = items.filter(i => i.x + (i.w || 0) <= fullX + 2 && i.y < headY - 2);
   // 每行以「滿分」欄（5**）為錨點，取上下中點為行界，合併該行所有科目名稱文字（處理換行的英文科名）
   const anchors = items.filter(i => i.y < headY - 2 && Math.abs(nearestHead(cx(i)) - cx(hFull)) < 1 && /^5\*\*$/.test(i.text)).map(i => i.y).sort((a, b) => b - a);
@@ -2440,7 +2440,7 @@ function parseGradeTable(items, term){
     let key = null;
     for (const d of SUBJECT_DEFS) { d.re.lastIndex = 0; if (d.re.test(txt)) { key = d.key; break; } }
     if (!key || grades[key]) return;
-    let g = c.text;
+    let g = unwrapGrade(c.text);
     if (key === 'csd') g = csdNorm(g); else if (!(g in SCORE)) return;
     grades[key] = g;
   });
@@ -2467,6 +2467,16 @@ const SUBJECT_DEFS = [
   { key: 'pe', re: /體育|Physical Education/g }
 ];
 const GRADE_TOKEN = /^(5\*\*|5\*|[1-5]|U|達標|不達標|A|B|C|Attained)$/;
+/** eClass 不合格常寫成 (1)／(U)。括號內若為有效等級則還原；其餘括號數值（如名次 (12)）仍略過。 */
+function unwrapGrade(t){
+  const s = String(t || '').trim();
+  const m = s.match(/^[(（\[]\s*(5\*\*|5\*|[1-5]|U|達標|不達標|A|B|C|Attained)\s*[)）\]]$/i);
+  if (!m) return s;
+  const g = m[1];
+  if (/^attained$/i.test(g)) return 'Attained';
+  return g;
+}
+function isGradeToken(t){ return GRADE_TOKEN.test(unwrapGrade(t)); }
 function parseGradesFromFlat(flat){
   const hits = [];
   SUBJECT_DEFS.forEach(d => { d.re.lastIndex = 0; let m; while ((m = d.re.exec(flat))) hits.push({ key: d.key, i: m.index, end: m.index + m[0].length }); });
@@ -2482,7 +2492,7 @@ function parseGradesFromFlat(flat){
     const seg = flat.slice(h.end, stop);
     const fm = seg.search(/5\*\*/); // 滿分欄（5**）之後才是成績
     const tail = fm >= 0 ? seg.slice(fm + 3) : seg;
-    const toks = tail.split(/\s+/).filter(t => !/^[(（\[].*[)）\]]$/.test(t)).filter(t => GRADE_TOKEN.test(t)).slice(0, 4); // 括號內為名次，略過
+    const toks = tail.split(/\s+/).map(unwrapGrade).filter(t => GRADE_TOKEN.test(t)).slice(0, 4); // (1)/(U) 還原為等級；其餘括號名次略過
     let g = toks.length >= 3 ? toks[2] : toks.length === 2 ? toks[1] : toks[0];
     if (!g) return;
     if (h.key === 'csd') g = csdNorm(g);
@@ -2642,7 +2652,7 @@ async function doRestore(){
 }
 
 /* 測試用掛鉤（不影響正式使用） */
-window.__hw6 = { S, parseGradeTable, csdPass, csdNorm, matchParsedFn: matchParsed, classDefaultTeacher, parseGradesFromFlat, parseEclassPages, matchParsed, convertV5, calcDSE, formModel, formHTML, buildDocx, extractPdfPages, esc, todayHK, printForms };
+window.__hw6 = { S, parseGradeTable, csdPass, csdNorm, unwrapGrade, isGradeToken, matchParsedFn: matchParsed, classDefaultTeacher, parseGradesFromFlat, parseEclassPages, matchParsed, convertV5, calcDSE, formModel, formHTML, buildDocx, extractPdfPages, esc, todayHK, printForms };
 
 document.addEventListener('DOMContentLoaded', init);
 </script>
